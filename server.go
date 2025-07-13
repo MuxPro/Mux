@@ -419,8 +419,24 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 			// Update LastActivity atomically
 			atomic.StoreInt64(&existingEntry.LastActivity, time.Now().UnixNano())
 			// Only update OriginalSource if it's different.
-			// Compare Address and Port fields manually as net.Destination doesn't have Equals.
-			if !existingEntry.OriginalSource.Address.Equals(udpSrc.Address) || existingEntry.OriginalSource.Port != udpSrc.Port {
+			// Compare Address and Port fields manually.
+			// net.Address interface does not have an Equals method, so compare based on Family and then IP/Domain string.
+			addressesEqual := false
+			if existingEntry.OriginalSource.Address.Family() == udpSrc.Address.Family() {
+				if existingEntry.OriginalSource.Address.IsIP() {
+					// For IP addresses, use net.IP.Equal
+					if existingEntry.OriginalSource.Address.IP().Equal(udpSrc.Address.IP()) {
+						addressesEqual = true
+					}
+				} else if existingEntry.OriginalSource.Address.IsDomain() {
+					// For domain addresses, compare strings
+					if existingEntry.OriginalSource.Address.Domain() == udpSrc.Address.Domain() {
+						addressesEqual = true
+					}
+				}
+			}
+
+			if !addressesEqual || existingEntry.OriginalSource.Port != udpSrc.Port {
 				existingEntry.OriginalSource = udpSrc
 				newError("updated UDP GlobalID mapping for ", globalID, " to new source: ", udpSrc).WriteToLog()
 			}
