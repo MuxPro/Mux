@@ -9,6 +9,13 @@ import (
 	"github.com/v2fly/v2ray-core/v5/common/protocol"
 )
 
+const (
+	// DefaultInitialCredit 是新会话的初始发送信用。
+	DefaultInitialCredit uint32 = 64 * 1024 // 64KB
+	// CreditUpdateThreshold 是触发信用更新的接收字节阈值。
+	CreditUpdateThreshold uint32 = 32 * 1024 // 32KB
+)
+
 // SessionManager 管理 Mux 主连接中的所有子连接。
 type SessionManager struct {
 	sync.RWMutex
@@ -62,9 +69,9 @@ func (m *SessionManager) Allocate() *Session {
 	s := &Session{
 		ID:           m.count,
 		parent:       m,
-		sendCredit:   0,    // Mux.Pro: 初始化发送信用为0
+		sendCredit:   DefaultInitialCredit, // Mux.Pro: 初始化发送信用为默认值
 		creditUpdate: make(chan struct{}, 1), // Mux.Pro: 初始化信用更新通知通道
-		// receiveWindow 暂时不在这里初始化，它通常由接收方维护
+		receivedBytes: 0, // Mux.Pro: 初始化接收字节计数
 	}
 	m.sessions[s.ID] = s
 	return s
@@ -95,6 +102,10 @@ func (m *SessionManager) Remove(id uint16) {
 
 	// Mux.Pro: 关闭信用更新通道以释放等待的 goroutine
 	if s, found := m.sessions[id]; found {
+		select { // 避免关闭已关闭的通道
+		case <-s.creditUpdate:
+		default:
+		}
 		close(s.creditUpdate)
 	}
 
@@ -150,6 +161,10 @@ func (m *SessionManager) Close() error {
 		common.Close(s.input)
 		common.Close(s.output)
 		// Mux.Pro: 关闭信用更新通道
+		select { // 避免关闭已关闭的通道
+		case <-s.creditUpdate:
+		default:
+		}
 		close(s.creditUpdate)
 	}
 
@@ -166,15 +181,16 @@ type Session struct {
 	transferType protocol.TransferType
 
 	// Mux.Pro: 流控相关字段
-	sendCredit   uint32        // 我方可以发送的字节数
-	creditUpdate chan struct{} // 通知通道，当信用更新时发送信号
+	sendCredit    uint32        // 我方可以发送的字节数 (原子操作)
+	creditUpdate  chan struct{} // 通知通道，当信用更新时发送信号
+	receivedBytes uint32        // 我方已接收的字节数，用于判断何时发送 CreditUpdate (原子操作)
 }
 
 // Close closes all resources associated with this session.
 func (s *Session) Close() error {
+	s.parent.Remove(s.ID) // 先从管理器中移除，这样 Remove 会关闭 creditUpdate channel
 	common.Close(s.output)
 	common.Close(s.input)
-	s.parent.Remove(s.ID)
 	return nil
 }
 
@@ -217,5 +233,20 @@ func (s *Session) ConsumeCredit(amount uint32) (uint32, bool) {
 		}
 		// CAS 失败，说明 credit 已经被其他 goroutine 修改，重试
 	}
+}
+
+// AddReceivedBytes 增加会话的接收字节计数。
+func (s *Session) AddReceivedBytes(count uint32) {
+	atomic.AddUint32(&s.receivedBytes, count)
+}
+
+// GetReceivedBytes 获取当前会话的接收字节计数。
+func (s *Session) GetReceivedBytes() uint32 {
+	return atomic.LoadUint32(&s.receivedBytes)
+}
+
+// ResetReceivedBytes 重置会话的接收字节计数。
+func (s *Session) ResetReceivedBytes() {
+	atomic.StoreUint32(&s.receivedBytes, 0)
 }
 
