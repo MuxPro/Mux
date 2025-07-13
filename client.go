@@ -370,23 +370,23 @@ func fetchInput(ctx context.Context, s *Session, output buf.Writer) {
 	}
 	s.transferType = transferType
 	// Mux.Pro: 传递优先级，默认为 0x00 (最高优先级)
-	writer := NewWriter(s.ID, dest, output, transferType, 0x00)
+	writer := NewWriter(s.ID, dest, output, transferType, 0x00, s)
 	defer s.Close()
-	defer writer.Close() // 修正: 不再传入错误码
+	defer writer.Close()
 
 	newError("dispatching request to ", dest).WriteToLog(session.ExportIDToError(ctx))
 	if err := writeFirstPayload(s.input, writer); err != nil {
 		newError("failed to write first payload").Base(err).WriteToLog(session.ExportIDToError(ctx))
-		writer.SetErrorCode(ErrorCodeProtocolError) // 修正: 使用 SetErrorCode
-		writer.Close() // 修正: 不再传入错误码
+		writer.SetErrorCode(ErrorCodeProtocolError)
+		writer.Close()
 		common.Interrupt(s.input)
 		return
 	}
 
 	if err := buf.Copy(s.input, writer); err != nil {
 		newError("failed to fetch all input").Base(err).WriteToLog(session.ExportIDToError(ctx))
-		writer.SetErrorCode(ErrorCodeProtocolError) // 修正: 使用 SetErrorCode
-		writer.Close() // 修正: 不再传入错误码
+		writer.SetErrorCode(ErrorCodeProtocolError)
+		writer.Close()
 		common.Interrupt(s.input)
 		return
 	}
@@ -421,7 +421,7 @@ func (m *ClientWorker) Dispatch(ctx context.Context, link *transport.Link) bool 
 	}
 
 	sm := m.sessionManager
-	s := sm.Allocate()
+	s := sm.Allocate() // Allocate 会创建并初始化 Session，包括流控字段
 	if s == nil {
 		return false
 	}
@@ -437,12 +437,6 @@ func (m *ClientWorker) handleStatueKeepAlive(meta *FrameMetadata, reader *buf.Bu
 	if meta.Option != 0 {
 		return newError("protocol error: KeepAlive frame with non-zero option: ", meta.Option)
 	}
-	// 如果 KeepAlive 帧带有 Extra Data，也视为协议错误并丢弃。
-	// 虽然 spec 说 Opt=0x00，但如果因为某种原因有数据，也应该处理掉。
-	// 这里假设 Unmarshal 已经处理了 Extra Data 的长度读取，如果 Opt 0x00，则没有 Extra Data。
-	// 如果 Unmarshal 没处理，这里需要显式地跳过 Extra Data。
-	// 根据 frame.go 的 Unmarshal 逻辑，它只处理 metadata，Extra Data 需要后续读取。
-	// 但 KeepAlive 帧不应有 Extra Data，所以这里不需要额外处理 Extra Data。
 	return nil
 }
 
@@ -455,6 +449,40 @@ func (m *ClientWorker) handleStatusNew(meta *FrameMetadata, reader *buf.Buffered
 	return nil
 }
 
+// handleCreditUpdate 处理 CreditUpdate 帧。
+func (m *ClientWorker) handleCreditUpdate(meta *FrameMetadata, reader *buf.BufferedReader) error {
+	if !meta.Option.Has(OptionData) {
+		return newError("CreditUpdate frame has no data")
+	}
+
+	s, found := m.sessionManager.Get(meta.SessionID)
+	if !found {
+		return buf.Copy(NewStreamReader(reader), buf.Discard) // 丢弃未知会话的信用更新
+	}
+
+	// 读取 Credit Increment (Extra Data)
+	dataLen, err := serial.ReadUint16(reader)
+	if err != nil {
+		return newError("failed to read CreditUpdate data length").Base(err)
+	}
+	if dataLen != 4 { // Mux.Pro 规范中 Credit Increment 是 4 字节 (uint32)
+		return newError("invalid CreditUpdate data length: ", dataLen)
+	}
+
+	payload := buf.New()
+	defer payload.Release()
+	if _, err := payload.ReadFullFrom(reader, int32(dataLen)); err != nil {
+		return newError("failed to read CreditUpdate payload").Base(err)
+	}
+
+	increment := binary.BigEndian.Uint32(payload.Bytes())
+	s.GrantCredit(increment) // 增加会话的发送信用
+
+	newError("session ", s.ID, " granted credit: ", increment).WriteToLog()
+	return nil
+}
+
+
 // handleStatusKeep 处理 Keep 帧（数据传输）。
 func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.BufferedReader) error {
 	if !meta.Option.Has(OptionData) {
@@ -463,24 +491,57 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 
 	s, found := m.sessionManager.Get(meta.SessionID)
 	if !found {
-		closingWriter := NewResponseWriter(meta.SessionID, m.link.Writer, protocol.TransferTypeStream)
-		closingWriter.SetErrorCode(ErrorCodeProtocolError) // 修正: 使用 SetErrorCode
-		closingWriter.Close() // 修正: 不再传入错误码
+		closingWriter := NewResponseWriter(meta.SessionID, m.link.Writer, protocol.TransferTypeStream, nil) // 对于未知会话，session 可以为 nil
+		closingWriter.SetErrorCode(ErrorCodeProtocolError)
+		closingWriter.Close()
 		return buf.Copy(NewStreamReader(reader), buf.Discard)
 	}
 
 	rr := s.NewReader(reader)
-	err := buf.Copy(rr, s.output) // 将数据从 Mux Reader 复制到会话输出流
+	var sc buf.SizeCounter // 声明一个 buf.SizeCounter 实例
+	err := buf.Copy(rr, s.output, buf.CountSize(&sc)) // 调用 buf.Copy 并传入 CountSize 选项
+	copiedBytes := sc.Size // 从 SizeCounter 获取复制的字节数
+
 	if err != nil && buf.IsWriteError(err) {
 		newError("failed to write to downstream. closing session ", s.ID).Base(err).WriteToLog()
-		closingWriter := NewResponseWriter(meta.SessionID, m.link.Writer, protocol.TransferTypeStream)
-		closingWriter.SetErrorCode(ErrorCodeProtocolError) // 修正: 使用 SetErrorCode
-		closingWriter.Close() // 修正: 不再传入错误码
+		closingWriter := NewResponseWriter(meta.SessionID, m.link.Writer, protocol.TransferTypeStream, s)
+		closingWriter.SetErrorCode(ErrorCodeProtocolError)
+		closingWriter.Close()
 		drainErr := buf.Copy(rr, buf.Discard) // 丢弃剩余数据
 		common.Interrupt(s.input)
 		s.Close()
 		return drainErr
 	}
+
+	// Mux.Pro: 接收方逻辑 - 发送 CreditUpdate 帧
+	s.AddReceivedBytes(uint32(copiedBytes))
+	if s.GetReceivedBytes() >= CreditUpdateThreshold {
+		newError("sending credit update for session ", s.ID, ", increment: ", DefaultInitialCredit).WriteToLog()
+		// 构造 CreditUpdate 帧
+		creditMeta := FrameMetadata{
+			SessionID:     s.ID,
+			SessionStatus: SessionStatusCreditUpdate,
+			Option:        OptionData, // 必须设置 OptionData，因为信用增量是 Extra Data
+		}
+		creditFrame := buf.New()
+		common.Must(creditMeta.WriteTo(creditFrame))
+
+		// 构造 Extra Data: 4字节信用增量
+		creditPayload := buf.New()
+		common.Must(WriteUint32(creditPayload, DefaultInitialCredit)) // 增加 DefaultInitialCredit 信用
+		defer creditPayload.Release()
+
+		Must2(serial.WriteUint16(creditFrame, uint16(creditPayload.Len())))
+		Must2(creditFrame.Write(creditPayload.Bytes()))
+
+		// 尝试发送 CreditUpdate 帧
+		if writeErr := m.link.Writer.WriteMultiBuffer(buf.MultiBuffer{creditFrame}); writeErr != nil {
+			newError("failed to send CreditUpdate frame for session ", s.ID).Base(writeErr).WriteToLog()
+		} else {
+			s.ResetReceivedBytes() // 成功发送后重置计数
+		}
+	}
+
 	return err
 }
 
@@ -535,6 +596,8 @@ func (m *ClientWorker) fetchOutput() {
 			err = m.handleStatusNew(&meta, reader)
 		case SessionStatusKeep:
 			err = m.handleStatusKeep(&meta, reader)
+		case SessionStatusCreditUpdate: // Mux.Pro: 处理信用更新帧
+			err = m.handleCreditUpdate(&meta, reader)
 		case SessionStatusNegotiateVersion:
 			// 协商后不应再收到此帧，视为协议错误
 			err = newError("unexpected NegotiateVersion frame after initial negotiation")
