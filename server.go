@@ -174,9 +174,9 @@ func (w *ServerWorker) negotiate(reader *buf.BufferedReader) error {
 	versionsPayload := buf.New()
 	defer versionsPayload.Release()
 	common.Must(versionsPayload.WriteByte(1)) // 版本数量 N = 1
-	common.Must(serial.WriteUint32(versionsPayload, negotiatedVersion))
+	common.Must(WriteUint32(versionsPayload, negotiatedVersion))
 
-	common.Must(serial.WriteUint16(frame, uint16(versionsPayload.Len())))
+	Must2(serial.WriteUint16(frame, uint16(versionsPayload.Len())))
 	frame.WriteAll(versionsPayload.Bytes())
 
 	if err := w.link.Writer.WriteMultiBuffer(buf.MultiBuffer{frame}); err != nil {
