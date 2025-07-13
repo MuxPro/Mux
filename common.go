@@ -1,5 +1,10 @@
 package mux
 
+import (
+    "encoding/binary"
+    "io"
+)
+
 // Must panics if the given error is not nil.
 // 这是 V2Ray 中常见的错误处理模式，用于简化代码。
 // 当一个错误被认为是“绝不应该发生”的情况下，可以用它来包裹函数调用。
@@ -18,4 +23,14 @@ func Must2[T any](v T, err error) T {
 		panic(err)
 	}
 	return v
+}
+
+// 写 uint16
+func WriteUint16(w io.Writer, v uint16) error {
+    return binary.Write(w, binary.BigEndian, v)
+}
+
+// 写 uint32
+func WriteUint32(w io.Writer, v uint32) error {
+    return binary.Write(w, binary.BigEndian, v)
 }
