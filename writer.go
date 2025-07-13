@@ -1,7 +1,9 @@
 package mux
 
 import (
+	"encoding/binary" // For binary.BigEndian
 	"time"
+
 	"github.com/v2fly/v2ray-core/v5/common"
 	"github.com/v2fly/v2ray-core/v5/common/buf"
 	"github.com/v2fly/v2ray-core/v5/common/errors"
@@ -10,17 +12,44 @@ import (
 	"github.com/v2fly/v2ray-core/v5/common/serial"
 )
 
+// Assuming these are defined elsewhere in the mux package (e.g., frame.go)
+// type FrameMetadata struct { ... }
+// type Option byte
+// const (
+//     OptionData Option = 0x01
+//     OptionUDPData Option = 0x02 // Mux.Pro: New option for UDP data
+// )
+// const (
+//     SessionStatusNew SessionStatus = 0x01
+//     SessionStatusKeep SessionStatus = 0x02
+//     SessionStatusEnd SessionStatus = 0x03
+// )
+// const (
+//     ErrorCodeGracefulShutdown uint16 = 0x0000
+//     ErrorCodeProtocolError uint16 = 0x0001
+// )
+// type GlobalID [8]byte
+// type TargetNetwork byte
+// const TargetNetworkUDP TargetNetwork = 0x02
+
+// Assuming addrParser is available for writing address and port.
+// var addrParser = &protocol.AddressPortParser{} // Example, actual implementation may vary.
+
 // Writer is responsible for packaging application layer data into Mux frames.
 type Writer struct {
 	dest             net.Destination
 	writer           buf.Writer
 	id               uint16
-	followup         bool
+	followup         bool // True if this is a subsequent frame for an existing session
 	transferType     protocol.TransferType
 	priority         byte
 	currentErrorCode uint16
 	session          *Session // Mux.Pro: Reference to the associated Session for flow control
-	globalID         GlobalID // Mux.Pro: GlobalID for UDP FullCone NAT
+	globalID         GlobalID // Mux.Pro: GlobalID for UDP FullCone NAT (client-side New frame)
+
+	// Mux.Pro: For server-side ResponseWriter, to embed UDP source in Keep frames
+	responseUDPSource *net.Destination // Source address of the UDP response from target server
+	responseGlobalID   GlobalID         // GlobalID to embed in server-to-client Keep frame
 }
 
 // NewWriter creates a new Writer for sending client-initiated Mux frames.
@@ -30,18 +59,18 @@ type Writer struct {
 // transferType: Protocol transfer type (Stream or Packet).
 // priority: Mux.Pro field, used to set the priority of a new connection.
 // s: Mux.Pro parameter, points to the Session associated with this Writer for flow control.
-// globalID: Mux.Pro parameter, GlobalID for UDP FullCone NAT.
+// globalID: Mux.Pro parameter, GlobalID for UDP FullCone NAT (used in New frame).
 func NewWriter(id uint16, dest net.Destination, writer buf.Writer, transferType protocol.TransferType, priority byte, s *Session, globalID GlobalID) *Writer {
 	return &Writer{
 		id:               id,
 		dest:             dest,
 		writer:           writer,
-		followup:         false,
+		followup:         false, // First frame will be SessionStatusNew
 		transferType:     transferType,
 		priority:         priority,
 		currentErrorCode: ErrorCodeGracefulShutdown, // Mux.Pro: Default to graceful shutdown
 		session:          s,                         // Mux.Pro: Associated Session
-		globalID:         globalID,                  // Mux.Pro: GlobalID
+		globalID:         globalID,                  // Mux.Pro: GlobalID for client's New frame
 	}
 }
 
@@ -50,12 +79,12 @@ func NewWriter(id uint16, dest net.Destination, writer buf.Writer, transferType 
 // writer: Underlying buffer writer.
 // transferType: Protocol transfer type (Stream or Packet).
 // s: Mux.Pro parameter, points to the Session associated with this Writer for flow control.
-// globalID: Mux.Pro parameter, GlobalID for UDP FullCone NAT.
+// globalID: Mux.Pro parameter, GlobalID from client's New frame (to be included in server responses).
 func NewResponseWriter(id uint16, writer buf.Writer, transferType protocol.TransferType, s *Session, globalID GlobalID) *Writer {
 	return &Writer{
 		id:               id,
 		writer:           writer,
-		followup:         true,
+		followup:         true, // Response Writer always sends Keep frames
 		transferType:     transferType,
 		priority:         0x00,                        // Mux.Pro: Response Writer default priority is 0
 		currentErrorCode: ErrorCodeGracefulShutdown, // Mux.Pro: Default to graceful shutdown
@@ -69,12 +98,21 @@ func (w *Writer) SetErrorCode(code uint16) {
 	w.currentErrorCode = code
 }
 
+// SetResponseUDPInfo sets the UDP source information and GlobalID to be embedded
+// in the next Keep frame sent from server to client.
+func (w *Writer) SetResponseUDPInfo(globalID GlobalID, src net.Destination) {
+	w.responseGlobalID = globalID
+	w.responseUDPSource = &src
+}
+
 // getNextFrameMeta generates the metadata for the next Mux frame.
 func (w *Writer) getNextFrameMeta() FrameMetadata {
 	meta := FrameMetadata{
 		SessionID: w.id,
 		Target:    w.dest,
-		GlobalID:  w.globalID, // Mux.Pro: Include GlobalID in metadata for New frames
+		// GlobalID is only set in New frames from client.
+		// For Keep frames, it's part of Extra Data for UDP responses from server.
+		// For client-to-server Keep frames, it's not in metadata.
 	}
 
 	if w.followup {
@@ -82,95 +120,118 @@ func (w *Writer) getNextFrameMeta() FrameMetadata {
 	} else {
 		w.followup = true
 		meta.SessionStatus = SessionStatusNew
-		// Mux.Pro: For SessionStatusNew frames, set priority
 		meta.Priority = w.priority
+		// For client-initiated New frames, GlobalID is part of FrameMetadata.
+		if w.transferType == protocol.TransferTypePacket && w.globalID != (GlobalID{}) {
+			meta.GlobalID = w.globalID
+		}
 	}
 
 	return meta
 }
 
-// writeMetaOnly sends a metadata-only frame (without extra data).
-func (w *Writer) writeMetaOnly() error {
-	meta := w.getNextFrameMeta()
-	b := buf.New()
-	if err := meta.WriteTo(b); err != nil {
-		return err
-	}
-	return w.writer.WriteMultiBuffer(buf.MultiBuffer{b})
-}
-
-// writeMetaWithFrame writes metadata and extra data.
+// writeMetaWithFrame writes metadata and a payload (Extra Data or actual data).
 // writer: The underlying buf.Writer.
 // meta: The FrameMetadata to be written.
-// data: The actual data payload (Extra Data).
-func writeMetaWithFrame(writer buf.Writer, meta FrameMetadata, data buf.MultiBuffer) error {
+// payload: The actual data payload (can be Extra Data or application data).
+func writeMetaWithFrame(writer buf.Writer, meta FrameMetadata, payload buf.MultiBuffer) error {
 	frame := buf.New()
 	if err := meta.WriteTo(frame); err != nil {
 		return err
 	}
-	// Mux.Pro: Extra Data itself has a length field
-	if _, err := serial.WriteUint16(frame, uint16(data.Len())); err != nil {
-		return err
-	}
 
-	if len(data)+1 > 64*1024*1024 { // Check if total length is too large
-		return errors.New("value too large")
-	}
-	sliceSize := len(data) + 1
-	mb2 := make(buf.MultiBuffer, 0, sliceSize)
-	mb2 = append(mb2, frame)
-	mb2 = append(mb2, data...)
-	return writer.WriteMultiBuffer(mb2)
+	// Write payload length and content
+	// Mux.Pro: This handles both Extra Data and actual data payload.
+	Must2(serial.WriteUint16(frame, uint16(payload.Len())))
+	Must2(frame.Write(payload.Bytes())) // Write all bytes from the MultiBuffer
+
+	return writer.WriteMultiBuffer(buf.MultiBuffer{frame})
 }
 
 // writeDataInternal is an internal function that actually writes data frames, without flow control logic.
-// It constructs the full Extra Data payload including any XUDP specific prefixes.
+// It constructs the full Extra Data payload including any UDP specific prefixes.
 // packetDest: For UDP packets, this is the associated net.Destination (e.g., source for responses, target for requests).
-func (w *Writer) writeDataInternal(mb buf.MultiBuffer, packetDest *net.Destination) error {
+// This parameter is used for client->server UDP (target) and server->client UDP (source).
+func (w *Writer) writeDataInternal(dataMB buf.MultiBuffer, packetDest *net.Destination) error {
 	meta := w.getNextFrameMeta()
-	meta.Option.Set(OptionData) // Set OptionData bit, indicating extra data presence
+	meta.Option.Set(OptionData) // Set OptionData bit, indicating data presence
 
-	var fullPayload buf.MultiBuffer // This will hold the XUDP prefix (if any) + actual data
+	var extraDataPayload buf.MultiBuffer // This will hold the UDP specific prefix (if any)
 
-	// Mux.Pro: Handle XUDP extension for Keep frames (for UDP packet transfer type)
-	// This applies to both client sending UDP data and server sending UDP responses.
+	// Mux.Pro: Handle UDP specific Extra Data for Keep frames.
+	// This applies to:
+	// 1. Client sending UDP data: `packetDest` is `w.dest` (target address).
+	// 2. Server sending UDP response: `packetDest` is `w.responseUDPSource` (actual source from target).
 	if meta.SessionStatus == SessionStatusKeep && w.transferType == protocol.TransferTypePacket {
-		// Check if packetDest is provided (meaning it's a UDP packet with specific address info)
 		if packetDest != nil {
-			meta.Option.Set(OptionUDPData) // Set the new OptionUDPData bit in metadata
+			meta.Option.Set(OptionUDPData) // Set the OptionUDPData bit in metadata
 
 			addrPrefix := buf.New()
-			// XUDP format for Extra Data prefix: 1 byte network type (0x02 for UDP), then address/port
+			// UDP Extra Data format: 1 byte network type (0x02 for UDP), then address/port
 			common.Must(addrPrefix.WriteByte(byte(TargetNetworkUDP)))
-			if err := addrParser.WriteAddressPort(addrPrefix, packetDest.Address, packetDest.Port); err != nil {
+			// Assuming addrParser.WriteAddressPort is available
+			// This part needs a concrete `addrParser` definition or direct implementation.
+			// For now, let's manually write address and port.
+			if packetDest.Address.Family().IsIPv4() {
+				common.Must(addrPrefix.WriteByte(protocol.AddressTypeIPv4))
+				common.Must(addrPrefix.Write(packetDest.Address.IP()))
+			} else if packetDest.Address.Family().IsIPv6() {
+				common.Must(addrPrefix.WriteByte(protocol.AddressTypeIPv6))
+				common.Must(addrPrefix.Write(packetDest.Address.IP()))
+			} else if packetDest.Address.Family().IsDomain() {
+				common.Must(addrPrefix.WriteByte(protocol.AddressTypeDomain))
+				common.Must(addrPrefix.WriteByte(byte(len(packetDest.Address.Domain()))))
+				common.Must(addrPrefix.WriteString(packetDest.Address.Domain()))
+			} else {
 				addrPrefix.Release()
-				return newError("failed to write UDP address/port prefix").Base(err)
+				return newError("unsupported UDP address family: ", packetDest.Address.Family()).AtWarning()
 			}
+			common.Must(WriteUint16(addrPrefix, uint16(packetDest.Port)))
+
 			// If GlobalID is present (e.g., server sending response with client's GlobalID), append it here
-			if w.globalID != (GlobalID{}) {
-				common.Must2(addrPrefix.Write(w.globalID[:]))
+			// For server-to-client responses, use w.responseGlobalID.
+			if w.responseGlobalID != (GlobalID{}) {
+				common.Must2(addrPrefix.Write(w.responseGlobalID[:]))
 			}
-			fullPayload = append(fullPayload, addrPrefix)
+
+			extraDataPayload = append(extraDataPayload, addrPrefix)
 		}
 	}
-	
-	fullPayload = append(fullPayload, mb...) // Append the actual data buffers
 
-	return writeMetaWithFrame(w.writer, meta, fullPayload)
+	// Construct the final frame with metadata, Extra Data (if any), and actual data payload.
+	frame := buf.New()
+	common.Must(meta.WriteTo(frame))
+
+	// Write Extra Data length and content if present
+	if !extraDataPayload.IsEmpty() {
+		Must2(serial.WriteUint16(frame, uint16(extraDataPayload.Len())))
+		Must2(frame.Write(extraDataPayload.Bytes()))
+	}
+
+	// Write actual data payload length and content
+	Must2(serial.WriteUint16(frame, uint16(dataMB.Len())))
+	Must2(frame.Write(dataMB.Bytes()))
+
+	return w.writer.WriteMultiBuffer(buf.MultiBuffer{frame})
 }
 
 // WriteMultiBuffer implements buf.Writer interface, writing MultiBuffer to Mux frames.
 // Includes Mux.Pro's credit-based flow control logic.
 func (w *Writer) WriteMultiBuffer(mb buf.MultiBuffer) error {
-	defer buf.ReleaseMulti(mb)
+	defer buf.ReleaseMulti(mb) // Ensure buffers are released
 
 	if mb.IsEmpty() {
-		return w.writeMetaOnly()
+		// If no data, but it's the first frame for a new session (client side), send a New frame without data.
+		// For Keep frames (followup is true), an empty MultiBuffer means no data to send, so just return.
+		if !w.followup {
+			return w.writeMetaOnly()
+		}
+		return nil
 	}
 
 	for !mb.IsEmpty() {
 		var currentChunk buf.MultiBuffer // Used to process the current chunk being sent
-		var packetDest *net.Destination // For UDP packets, this will hold the associated address/port
+		var packetDest *net.Destination   // For UDP packets, this will hold the associated address/port
 
 		if w.transferType == protocol.TransferTypeStream {
 			// Stream mode splits by 8KB, or all remaining data
@@ -183,19 +244,20 @@ func (w *Writer) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			packetDest = nil // No specific UDP destination for stream data
 		} else {
 			// Packet mode takes the whole MultiBuffer as one packet.
-			// The UDP metadata (source/destination for the packet) needs to be available.
-			// Since buf.MultiBuffer does not have a .UDP field in the provided definition,
-			// we temporarily use w.dest. This needs to be refined for full FullCone NAT.
-			currentChunk = mb 
+			// For client-side outbound UDP, `w.dest` is the target.
+			// For server-side inbound UDP responses, `w.responseUDPSource` is the actual source from the target.
+			currentChunk = mb
 			mb = nil // All data processed for this iteration
 
-			// IMPORTANT: This is a placeholder for the actual UDP packet's source/destination.
-			// In a full XUDP implementation, this `packetDest` would come from the
-			// `buf.Buffer` itself (if it supported a .UDP field) or be passed explicitly
-			// by the upstream `buf.Reader` (e.g., a custom PacketReader).
-			// For client-side outbound UDP, w.dest is the target.
-			// For server-side inbound UDP responses, this needs to be the *source* of the response.
-			packetDest = &w.dest // Temporary: Use session's target as packet destination
+			if w.followup { // This is a Keep frame
+				if w.responseUDPSource != nil { // Server sending response
+					packetDest = w.responseUDPSource
+				} else { // Client sending request (initial New frame already handled globalID)
+					packetDest = &w.dest // Use the session's target destination
+				}
+			} else { // This is a New frame (client-side)
+				packetDest = &w.dest // New frame always uses the session's target destination
+			}
 		}
 
 		chunkLen := uint32(currentChunk.Len())
@@ -203,30 +265,39 @@ func (w *Writer) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			continue
 		}
 
-		for chunkLen > 0 { // Loop until the current chunk is fully sent
-			// Mux.Pro: Before attempting to consume credit or wait, check if SessionManager is closing
-			if w.session.parent.Closed() {
-				return newError("session manager closed while waiting for credit for session ", w.id).AtWarning()
-			}
+		// Only apply flow control if it's a client sending data.
+		// Server sending data back to client is currently not credit-controlled by client in Mux.Pro.
+		if !w.followup { // Client sending New or subsequent Keep frame
+			for chunkLen > 0 { // Loop until the current chunk is fully sent
+				// Mux.Pro: Before attempting to consume credit or wait, check if SessionManager is closing
+				if w.session == nil || w.session.parent == nil || w.session.parent.Closed() {
+					return newError("session or session manager closed while waiting for credit for session ", w.id).AtWarning()
+				}
 
-			consumed, ok := w.session.ConsumeCredit(chunkLen)
-			if ok {
-				// Successfully consumed credit, send the corresponding part of the data
-				partToSend, remainingInChunk := buf.SplitSize(currentChunk, int32(consumed))
-				if err := w.writeDataInternal(partToSend, packetDest); err != nil { // Pass packetDest
-					return err
+				consumed, ok := w.session.ConsumeCredit(chunkLen)
+				if ok {
+					// Successfully consumed credit, send the corresponding part of the data
+					partToSend, remainingInChunk := buf.SplitSize(currentChunk, int32(consumed))
+					if err := w.writeDataInternal(partToSend, packetDest); err != nil {
+						return err
+					}
+					currentChunk = remainingInChunk // Update currentChunk to the remaining unsent part
+					chunkLen -= consumed
+				} else {
+					// No credit available, wait for credit update signal or timeout
+					select {
+					case <-w.session.creditUpdate:
+						// Received credit update signal, continue trying to consume credit
+						continue
+					case <-time.After(time.Second * 30): // Set timeout to prevent indefinite blocking
+						return newError("writer for session ", w.id, " blocked due to no credit, timed out").AtWarning()
+					}
 				}
-				currentChunk = remainingInChunk // Update currentChunk to the remaining unsent part
-				chunkLen -= consumed
-			} else {
-				// No credit available, wait for credit update signal or timeout
-				select {
-				case <-w.session.creditUpdate:
-					// Received credit update signal, continue trying to consume credit
-					continue
-				case <-time.After(time.Second * 30): // Set timeout to prevent indefinite blocking
-					return newError("writer for session ", w.id, " blocked due to no credit, timed out").AtWarning()
-				}
+			}
+		} else { // Server sending data (followup is true)
+			// Server-to-client data is not credit-controlled by client.
+			if err := w.writeDataInternal(currentChunk, packetDest); err != nil {
+				return err
 			}
 		}
 	}
@@ -250,7 +321,18 @@ func (w *Writer) Close() error {
 	frame := buf.New()
 	common.Must(meta.WriteTo(frame))
 
+	// If OptionData is set (meaning ErrorCode is present), write the error code as Extra Data.
+	if meta.Option.Has(OptionData) {
+		errorCodePayload := buf.New()
+		common.Must(WriteUint16(errorCodePayload, w.currentErrorCode)) // ErrorCode is uint16 (2 bytes)
+		defer errorCodePayload.Release()
+
+		Must2(serial.WriteUint16(frame, uint16(errorCodePayload.Len()))) // Write Extra Data length
+		Must2(frame.Write(errorCodePayload.Bytes()))                     // Write Extra Data content
+	}
+
 	// Attempt to write End frame, do not handle error as connection might be broken.
-	w.writer.WriteMultiBuffer(buf.MultiBuffer{frame})
+	// This is a best-effort send.
+	_ = w.writer.WriteMultiBuffer(buf.MultiBuffer{frame})
 	return nil
 }
