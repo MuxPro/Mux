@@ -91,7 +91,8 @@ func NewServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.
 // handle 处理子连接的数据转发。
 func handle(ctx context.Context, s *Session, output buf.Writer) {
 	writer := NewResponseWriter(s.ID, output, s.transferType, s)
-	if err := buf.Copy(s.input, writer); err != nil {
+	// 修正: buf.Copy 返回 (int64, error)
+	if _, err := buf.Copy(s.input, writer); err != nil {
 		newError("session ", s.ID, " ends.").Base(err).WriteToLog(session.ExportIDToError(ctx))
 		writer.SetErrorCode(ErrorCodeProtocolError)
 		writer.Close()
@@ -194,8 +195,9 @@ func (w *ServerWorker) negotiate(reader *buf.BufferedReader) error {
 	common.Must(versionsPayload.WriteByte(1)) // 版本数量 N = 1
 	common.Must(WriteUint32(versionsPayload, negotiatedVersion))
 
-	Must2(serial.WriteUint16(frame, uint16(versionsPayload.Len()))) // 写入 Extra Data 长度
-	Must2(frame.Write(versionsPayload.Bytes()))                     // 写入 Extra Data 内容
+	// 修正: common.Must 只需要 error 参数
+	common.Must(serial.WriteUint16(frame, uint16(versionsPayload.Len())))
+	common.Must(frame.Write(versionsPayload.Bytes()))
 
 	if err := w.link.Writer.WriteMultiBuffer(buf.MultiBuffer{frame}); err != nil {
 		return newError("failed to write negotiation response").Base(err)
@@ -314,13 +316,15 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	}
 
 	rr := s.NewReader(reader)
+	// 修正: buf.Copy 返回 (int64, error)
 	copiedBytes, err := buf.Copy(rr, s.output) // 将数据从 Mux Reader 复制到会话输出流
 	if err != nil && buf.IsWriteError(err) {
 		newError("failed to write to downstream writer. closing session ", s.ID).Base(err).WriteToLog()
 		closingWriter := NewResponseWriter(meta.SessionID, w.link.Writer, protocol.TransferTypeStream, s)
 		closingWriter.SetErrorCode(ErrorCodeProtocolError)
 		closingWriter.Close()
-		drainErr := buf.Copy(rr, buf.Discard) // 丢弃剩余数据
+		// 修正: buf.Copy 返回 (int64, error)
+		drainErr, _ := buf.Copy(rr, buf.Discard) // 丢弃剩余数据
 		common.Interrupt(s.input)
 		s.Close()
 		return drainErr
@@ -344,6 +348,7 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 		common.Must(WriteUint32(creditPayload, DefaultInitialCredit)) // 增加 DefaultInitialCredit 信用
 		defer creditPayload.Release()
 
+		// 修正: common.Must 只需要 error 参数
 		common.Must(serial.WriteUint16(creditFrame, uint16(creditPayload.Len())))
 		common.Must(creditFrame.Write(creditPayload.Bytes()))
 
