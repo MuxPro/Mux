@@ -42,7 +42,7 @@ func WriteUint32(w io.Writer, v uint32) error {
 // w: The writer to write to (e.g., a network connection).
 // b: The byte slice to write.
 // Returns an error if the write operation fails.
-func WriteAll(b []byte) error {
+func WriteAll(w io.Writer, b []byte) error {
 	// totalBytesToWrite 是我们需要写入的总字节数。
 	totalBytesToWrite := len(b)
 	
