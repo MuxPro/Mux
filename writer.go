@@ -24,9 +24,13 @@ type Writer struct {
 }
 
 // NewWriter creates a new Writer for sending client-initiated Mux frames.
-// priority: Mux.Pro new field, used to set the priority of a new connection.
-// s: Mux.Pro new parameter, points to the Session associated with this Writer for flow control.
-// globalID: Mux.Pro new parameter, GlobalID for UDP FullCone NAT.
+// id: Session ID.
+// dest: Target destination.
+// writer: Underlying buffer writer.
+// transferType: Protocol transfer type (Stream or Packet).
+// priority: Mux.Pro field, used to set the priority of a new connection.
+// s: Mux.Pro parameter, points to the Session associated with this Writer for flow control.
+// globalID: Mux.Pro parameter, GlobalID for UDP FullCone NAT.
 func NewWriter(id uint16, dest net.Destination, writer buf.Writer, transferType protocol.TransferType, priority byte, s *Session, globalID GlobalID) *Writer {
 	return &Writer{
 		id:               id,
@@ -42,8 +46,12 @@ func NewWriter(id uint16, dest net.Destination, writer buf.Writer, transferType 
 }
 
 // NewResponseWriter creates a new Writer for sending server response Mux frames.
-// s: Mux.Pro new parameter, points to the Session associated with this Writer for flow control.
-func NewResponseWriter(id uint16, writer buf.Writer, transferType protocol.TransferType, s *Session) *Writer {
+// id: Session ID.
+// writer: Underlying buffer writer.
+// transferType: Protocol transfer type (Stream or Packet).
+// s: Mux.Pro parameter, points to the Session associated with this Writer for flow control.
+// globalID: Mux.Pro parameter, GlobalID for UDP FullCone NAT.
+func NewResponseWriter(id uint16, writer buf.Writer, transferType protocol.TransferType, s *Session, globalID GlobalID) *Writer {
 	return &Writer{
 		id:               id,
 		writer:           writer,
@@ -52,7 +60,7 @@ func NewResponseWriter(id uint16, writer buf.Writer, transferType protocol.Trans
 		priority:         0x00,                        // Mux.Pro: Response Writer default priority is 0
 		currentErrorCode: ErrorCodeGracefulShutdown, // Mux.Pro: Default to graceful shutdown
 		session:          s,                         // Mux.Pro: Associated Session
-		globalID:         GlobalID{},                // Mux.Pro: Response writer doesn't generate GlobalID
+		globalID:         globalID,                  // Mux.Pro: GlobalID from client's New frame
 	}
 }
 
@@ -66,7 +74,7 @@ func (w *Writer) getNextFrameMeta() FrameMetadata {
 	meta := FrameMetadata{
 		SessionID: w.id,
 		Target:    w.dest,
-		GlobalID:  w.globalID, // Mux.Pro: Include GlobalID in metadata
+		GlobalID:  w.globalID, // Mux.Pro: Include GlobalID in metadata for New frames
 	}
 
 	if w.followup {
@@ -92,6 +100,9 @@ func (w *Writer) writeMetaOnly() error {
 }
 
 // writeMetaWithFrame writes metadata and extra data.
+// writer: The underlying buf.Writer.
+// meta: The FrameMetadata to be written.
+// data: The actual data payload (Extra Data).
 func writeMetaWithFrame(writer buf.Writer, meta FrameMetadata, data buf.MultiBuffer) error {
 	frame := buf.New()
 	if err := meta.WriteTo(frame); err != nil {
@@ -113,10 +124,38 @@ func writeMetaWithFrame(writer buf.Writer, meta FrameMetadata, data buf.MultiBuf
 }
 
 // writeDataInternal is an internal function that actually writes data frames, without flow control logic.
+// It constructs the full Extra Data payload including any XUDP specific prefixes.
 func (w *Writer) writeDataInternal(mb buf.MultiBuffer) error {
 	meta := w.getNextFrameMeta()
 	meta.Option.Set(OptionData) // Set OptionData bit, indicating extra data presence
-	return writeMetaWithFrame(w.writer, meta, mb)
+
+	var fullPayload buf.MultiBuffer // This will hold the XUDP prefix (if any) + actual data
+
+	// Mux.Pro: Handle XUDP extension for Keep frames (for UDP packet transfer type)
+	// This applies to both client sending UDP data and server sending UDP responses.
+	if meta.SessionStatus == SessionStatusKeep && w.transferType == protocol.TransferTypePacket {
+		// Check if the current buffer has UDP metadata (original UDP packet from application or response)
+		if !mb.IsEmpty() && mb[0].UDP != nil {
+			meta.Option.Set(OptionUDPData) // Set the new OptionUDPData bit in metadata
+
+			addrPrefix := buf.New()
+			// XUDP format for Extra Data prefix: 1 byte network type (0x02 for UDP), then address/port
+			common.Must(addrPrefix.WriteByte(byte(TargetNetworkUDP)))
+			if err := addrParser.WriteAddressPort(addrPrefix, mb[0].UDP.Address, mb[0].UDP.Port); err != nil {
+				addrPrefix.Release()
+				return newError("failed to write UDP address/port prefix").Base(err)
+			}
+			// If GlobalID is present (e.g., server sending response with client's GlobalID), append it here
+			if w.globalID != (GlobalID{}) {
+				common.Must(addrPrefix.Write(w.globalID[:]))
+			}
+			fullPayload = append(fullPayload, addrPrefix)
+		}
+	}
+	
+	fullPayload = append(fullPayload, mb...) // Append the actual data buffers
+
+	return writeMetaWithFrame(w.writer, meta, fullPayload)
 }
 
 // WriteMultiBuffer implements buf.Writer interface, writing MultiBuffer to Mux frames.
