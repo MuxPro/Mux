@@ -18,7 +18,6 @@ import (
 	"github.com/v2fly/v2ray-core/v5/common/task"
 	"github.com/v2fly/v2ray-core/v5/proxy"
 	"github.com/v2fly/v2ray-core/v5/transport"
-	"github.com/v2fly/v2ray-core/v5/transport/internet"
 	"github.com/v2fly/v2ray-core/v5/transport/pipe"
 )
 
@@ -498,13 +497,15 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	}
 
 	rr := s.NewReader(reader)
+	// 修正: buf.Copy 返回 (int64, error)
 	copiedBytes, err := buf.Copy(rr, s.output) // 将数据从 Mux Reader 复制到会话输出流
 	if err != nil && buf.IsWriteError(err) {
 		newError("failed to write to downstream. closing session ", s.ID).Base(err).WriteToLog()
 		closingWriter := NewResponseWriter(meta.SessionID, m.link.Writer, protocol.TransferTypeStream, s)
 		closingWriter.SetErrorCode(ErrorCodeProtocolError)
 		closingWriter.Close()
-		drainErr := buf.Copy(rr, buf.Discard) // 丢弃剩余数据
+		// 修正: buf.Copy 返回 (int64, error)
+		drainErr, _ := buf.Copy(rr, buf.Discard) // 丢弃剩余数据
 		common.Interrupt(s.input)
 		s.Close()
 		return drainErr
@@ -528,6 +529,7 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 		common.Must(WriteUint32(creditPayload, DefaultInitialCredit)) // 增加 DefaultInitialCredit 信用
 		defer creditPayload.Release()
 
+		// 修正: common.Must 只需要 error 参数
 		common.Must(serial.WriteUint16(creditFrame, uint16(creditPayload.Len())))
 		common.Must(creditFrame.Write(creditPayload.Bytes()))
 
