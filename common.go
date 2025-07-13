@@ -34,3 +34,36 @@ func WriteUint16(w io.Writer, v uint16) error {
 func WriteUint32(w io.Writer, v uint32) error {
     return binary.Write(w, binary.BigEndian, v)
 }
+
+// WriteAll writes all bytes from a slice to a writer.
+// It loops until all bytes are written or an error occurs.
+// This is a manual implementation of what io.WriteFull does.
+//
+// w: The writer to write to (e.g., a network connection).
+// b: The byte slice to write.
+// Returns an error if the write operation fails.
+func WriteAll(w io.Writer, b []byte) error {
+	// totalBytesToWrite 是我们需要写入的总字节数。
+	totalBytesToWrite := len(b)
+	
+	// bytesWritten 是已经成功写入的字节数。
+	bytesWritten := 0
+
+	// 循环直到所有字节都已写入。
+	for bytesWritten < totalBytesToWrite {
+		// 从上次写入结束的位置开始，尝试写入剩余的字节。
+		// b[bytesWritten:] 是一个切片，指向尚未写入的数据。
+		n, err := w.Write(b[bytesWritten:])
+		if err != nil {
+			// 如果发生任何错误（例如连接断开），立即返回错误。
+			return err
+		}
+
+		// 将本次写入的字节数累加到总数中。
+		bytesWritten += n
+	}
+
+	// 如果循环正常结束，说明所有字节都已成功写入，返回 nil 错误。
+	return nil
+}
+
