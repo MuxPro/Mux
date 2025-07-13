@@ -1,6 +1,7 @@
 package mux
 
 import (
+	"time" // 引入 time 包用于超时
 	"github.com/v2fly/v2ray-core/v5/common"
 	"github.com/v2fly/v2ray-core/v5/common/buf"
 	"github.com/v2fly/v2ray-core/v5/common/errors"
@@ -16,13 +17,15 @@ type Writer struct {
 	id               uint16
 	followup         bool
 	transferType     protocol.TransferType
-	priority         byte   // Mux.Pro: 用于 New 帧的优先级
-	currentErrorCode uint16 // Mux.Pro: 用于 End 帧的错误码，默认为 GracefulShutdown
+	priority         byte
+	currentErrorCode uint16
+	session          *Session // Mux.Pro: 引用关联的 Session，用于流控
 }
 
 // NewWriter 创建一个新的 Writer，用于发送客户端发起的 Mux 帧。
 // priority: Mux.Pro 新增字段，用于设置新连接的优先级。
-func NewWriter(id uint16, dest net.Destination, writer buf.Writer, transferType protocol.TransferType, priority byte) *Writer {
+// s: Mux.Pro 新增参数，指向此 Writer 关联的 Session，用于流控。
+func NewWriter(id uint16, dest net.Destination, writer buf.Writer, transferType protocol.TransferType, priority byte, s *Session) *Writer {
 	return &Writer{
 		id:               id,
 		dest:             dest,
@@ -31,11 +34,13 @@ func NewWriter(id uint16, dest net.Destination, writer buf.Writer, transferType 
 		transferType:     transferType,
 		priority:         priority,
 		currentErrorCode: ErrorCodeGracefulShutdown, // Mux.Pro: 默认正常关闭
+		session:          s,                         // Mux.Pro: 关联 Session
 	}
 }
 
 // NewResponseWriter 创建一个新的 Writer，用于发送服务器响应的 Mux 帧。
-func NewResponseWriter(id uint16, writer buf.Writer, transferType protocol.TransferType) *Writer {
+// s: Mux.Pro 新增参数，指向此 Writer 关联的 Session，用于流控。
+func NewResponseWriter(id uint16, writer buf.Writer, transferType protocol.TransferType, s *Session) *Writer {
 	return &Writer{
 		id:               id,
 		writer:           writer,
@@ -43,6 +48,7 @@ func NewResponseWriter(id uint16, writer buf.Writer, transferType protocol.Trans
 		transferType:     transferType,
 		priority:         0x00,                        // Mux.Pro: 响应Writer默认优先级为0
 		currentErrorCode: ErrorCodeGracefulShutdown, // Mux.Pro: 默认正常关闭
+		session:          s,                         // Mux.Pro: 关联 Session
 	}
 }
 
@@ -101,15 +107,15 @@ func writeMetaWithFrame(writer buf.Writer, meta FrameMetadata, data buf.MultiBuf
 	return writer.WriteMultiBuffer(mb2)
 }
 
-// writeData 写入带有额外数据的 Mux 帧。
-func (w *Writer) writeData(mb buf.MultiBuffer) error {
+// writeDataInternal 是实际写入数据帧的内部函数，不包含流控逻辑。
+func (w *Writer) writeDataInternal(mb buf.MultiBuffer) error {
 	meta := w.getNextFrameMeta()
 	meta.Option.Set(OptionData) // 设置 OptionData 位，表示有额外数据
-
 	return writeMetaWithFrame(w.writer, meta, mb)
 }
 
 // WriteMultiBuffer 实现 buf.Writer 接口，将 MultiBuffer 写入 Mux 帧。
+// 包含了 Mux.Pro 的信用流控逻辑。
 func (w *Writer) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	defer buf.ReleaseMulti(mb)
 
@@ -120,14 +126,52 @@ func (w *Writer) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	for !mb.IsEmpty() {
 		var chunk buf.MultiBuffer
 		if w.transferType == protocol.TransferTypeStream {
-			mb, chunk = buf.SplitSize(mb, 8*1024) // 流模式按大小分割
+			// 流模式按 8KB 分割，或者剩余所有数据
+			if mb.Len() > 8*1024 {
+				mb, chunk = buf.SplitSize(mb, 8*1024)
+			} else {
+				chunk = mb
+				mb = nil // 所有数据都已处理
+			}
 		} else {
-			mb2, b := buf.SplitFirst(mb) // 包模式取第一个包
+			// 包模式取第一个包
+			mb2, b := buf.SplitFirst(mb)
 			mb = mb2
 			chunk = buf.MultiBuffer{b}
 		}
-		if err := w.writeData(chunk); err != nil {
-			return err
+
+		// Mux.Pro: Credit-based flow control for each chunk
+		chunkLen := uint32(chunk.Len())
+		if chunkLen == 0 { // 空块，直接跳过
+			continue
+		}
+
+		for { // 循环直到成功消费信用并发送数据
+			consumed, ok := w.session.ConsumeCredit(chunkLen)
+			if ok {
+				// 成功消费了信用，发送相应部分的数据
+				partToSend := buf.SplitSize(chunk, int32(consumed))
+				if err := w.writeDataInternal(partToSend); err != nil {
+					return err
+				}
+				chunk = chunk.SliceFrom(int32(consumed)) // 更新 chunk 为剩余未发送的数据
+				chunkLen -= consumed
+				if chunkLen == 0 { // 当前 chunk 已全部发送
+					break // 跳出内部循环，处理下一个原始 mb 的 chunk
+				}
+			} else {
+				// 没有信用可消费，等待信用更新信号
+				select {
+				case <-w.session.creditUpdate:
+					// 收到信用更新信号，继续尝试消费信用
+					continue
+				case <-w.session.parent.CloseIfNoSession(): // 检查 SessionManager 是否正在关闭
+					// 如果 SessionManager 正在关闭，则停止等待并返回错误
+					return newError("session manager closing while waiting for credit for session ", w.id).AtWarning()
+				case <-time.After(time.Second * 30): // 设置超时，防止无限期阻塞
+					return newError("writer for session ", w.id, " blocked due to no credit, timed out").AtWarning()
+				}
+			}
 		}
 	}
 
