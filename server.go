@@ -6,7 +6,7 @@ import (
 	"encoding/binary"
 	"io"
 	"sync" // For sync.Map
-	"sync/atomic" // For atomic.Int64
+	"sync/atomic" // For atomic operations on int64
 	"time"
 
 	core "github.com/v2fly/v2ray-core/v5"
@@ -77,7 +77,7 @@ func (s *Server) Close() error {
 // udpMappingEntry stores the original source and last activity time for a GlobalID.
 type udpMappingEntry struct {
 	OriginalSource net.Destination
-	LastActivity   atomic.Int64 // UnixNano timestamp
+	LastActivity   int64 // UnixNano timestamp, will be accessed atomically
 }
 
 const UDPGlobalIDTTL = time.Minute * 2         // 2 minutes TTL for UDP GlobalID mappings
@@ -122,7 +122,8 @@ func (w *ServerWorker) cleanupUDPGlobalIDMap(ctx context.Context) {
 			w.udpGlobalIDMap.Range(func(key, value interface{}) bool {
 				globalID := key.(GlobalID)
 				entry := value.(*udpMappingEntry)
-				if time.Duration(now-entry.LastActivity.Load()) > UDPGlobalIDTTL {
+				// Access LastActivity atomically
+				if time.Duration(now - atomic.LoadInt64(&entry.LastActivity)) > UDPGlobalIDTTL {
 					newError("cleaning up expired UDP GlobalID mapping: ", globalID).WriteToLog()
 					w.udpGlobalIDMap.Delete(globalID)
 				}
@@ -225,9 +226,9 @@ func (w *ServerWorker) negotiate(reader *buf.BufferedReader) error {
 				found = true
 				break
 			}
-			if found {
-				break
-			}
+		}
+		if found {
+			break
 		}
 	}
 
@@ -348,7 +349,7 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 			// Add/update mapping in the concurrent map
 			w.udpGlobalIDMap.Store(s.globalID, &udpMappingEntry{
 				OriginalSource: inbound.Source,
-				LastActivity:   atomic.Int64(time.Now().UnixNano()),
+				LastActivity:   time.Now().UnixNano(), // Set initial timestamp
 			})
 			newError("stored UDP GlobalID mapping: ", s.globalID, " -> ", s.originalSource).WriteToLog()
 		}
@@ -378,9 +379,16 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	if !found {
 		// Determine transferType for closingWriter based on the incoming frame's target
 		tt := protocol.TransferTypeStream
-		if meta.Target.Network == net.Network_UDP { // If the original frame's target was UDP
+		// If the incoming frame's target was UDP (which is not directly in meta for Keep frames,
+		// but derived from the session's transferType if it's a UDP session).
+		// We assume if the session is not found, we can't know its original transfer type reliably,
+		// so default to stream or try to infer from OptionUDPData if present.
+		// For now, if session not found, we can't know if it was UDP or TCP, so default to stream.
+		// If OptionUDPData is set, it implies UDP.
+		if meta.Option.Has(OptionUDPData) {
 			tt = protocol.TransferTypePacket
 		}
+
 		// Pass the GlobalID from the incoming frame's metadata to the closingWriter
 		closingWriter := NewResponseWriter(meta.SessionID, w.link.Writer, tt, nil, meta.GlobalID)
 		closingWriter.SetErrorCode(ErrorCodeProtocolError)
@@ -406,18 +414,24 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 		newError("received UDP data for session ", s.ID, " from ", udpSrc, " GlobalID: ", globalID).WriteToLog()
 
 		// Update the GlobalID mapping with the latest activity and source
-		if entry, loaded := w.udpGlobalIDMap.LoadOrStore(globalID, &udpMappingEntry{
-			OriginalSource: udpSrc,
-			LastActivity:   atomic.Int64(time.Now().UnixNano()),
-		}); loaded {
-			// If already exists, update LastActivity and potentially OriginalSource
-			existingEntry := entry.(*udpMappingEntry)
-			existingEntry.LastActivity.Store(time.Now().UnixNano())
-			// Only update OriginalSource if it's different, or if we want to strictly follow the latest source.
-			if !existingEntry.OriginalSource.Equals(udpSrc) {
+		if entryVal, loaded := w.udpGlobalIDMap.Load(globalID); loaded {
+			existingEntry := entryVal.(*udpMappingEntry)
+			// Update LastActivity atomically
+			atomic.StoreInt64(&existingEntry.LastActivity, time.Now().UnixNano())
+			// Only update OriginalSource if it's different.
+			// Compare Address and Port fields manually as net.Destination doesn't have Equals.
+			if !existingEntry.OriginalSource.Address.Equals(udpSrc.Address) || existingEntry.OriginalSource.Port != udpSrc.Port {
 				existingEntry.OriginalSource = udpSrc
 				newError("updated UDP GlobalID mapping for ", globalID, " to new source: ", udpSrc).WriteToLog()
 			}
+		} else {
+			// If not loaded, store it. This might happen if a Keep frame arrives before New frame (protocol error),
+			// or if the mapping was cleaned up but the session is still active.
+			w.udpGlobalIDMap.Store(globalID, &udpMappingEntry{
+				OriginalSource: udpSrc,
+				LastActivity:   time.Now().UnixNano(),
+			})
+			newError("created new UDP GlobalID mapping from Keep frame: ", globalID, " -> ", udpSrc).WriteToLog()
 		}
 	}
 
