@@ -370,23 +370,24 @@ func fetchInput(ctx context.Context, s *Session, output buf.Writer) {
 	}
 	s.transferType = transferType
 	// Mux.Pro: 传递优先级，默认为 0x00 (最高优先级)
-	writer := NewWriter(s.ID, dest, output, transferType, 0x00)
+	// 修正: 传入 session 参数
+	writer := NewWriter(s.ID, dest, output, transferType, 0x00, s)
 	defer s.Close()
-	defer writer.Close() // 修正: 不再传入错误码
+	defer writer.Close()
 
 	newError("dispatching request to ", dest).WriteToLog(session.ExportIDToError(ctx))
 	if err := writeFirstPayload(s.input, writer); err != nil {
 		newError("failed to write first payload").Base(err).WriteToLog(session.ExportIDToError(ctx))
-		writer.SetErrorCode(ErrorCodeProtocolError) // 修正: 使用 SetErrorCode
-		writer.Close() // 修正: 不再传入错误码
+		writer.SetErrorCode(ErrorCodeProtocolError)
+		writer.Close()
 		common.Interrupt(s.input)
 		return
 	}
 
 	if err := buf.Copy(s.input, writer); err != nil {
 		newError("failed to fetch all input").Base(err).WriteToLog(session.ExportIDToError(ctx))
-		writer.SetErrorCode(ErrorCodeProtocolError) // 修正: 使用 SetErrorCode
-		writer.Close() // 修正: 不再传入错误码
+		writer.SetErrorCode(ErrorCodeProtocolError)
+		writer.Close()
 		common.Interrupt(s.input)
 		return
 	}
@@ -421,12 +422,13 @@ func (m *ClientWorker) Dispatch(ctx context.Context, link *transport.Link) bool 
 	}
 
 	sm := m.sessionManager
-	s := sm.Allocate()
+	s := sm.Allocate() // Allocate 会创建并初始化 Session，包括流控字段
 	if s == nil {
 		return false
 	}
 	s.input = link.Reader
 	s.output = link.Writer
+	// 修正: NewWriter 现在在 fetchInput 内部调用，并传入 Session
 	go fetchInput(ctx, s, m.link.Writer)
 	return true
 }
@@ -437,12 +439,6 @@ func (m *ClientWorker) handleStatueKeepAlive(meta *FrameMetadata, reader *buf.Bu
 	if meta.Option != 0 {
 		return newError("protocol error: KeepAlive frame with non-zero option: ", meta.Option)
 	}
-	// 如果 KeepAlive 帧带有 Extra Data，也视为协议错误并丢弃。
-	// 虽然 spec 说 Opt=0x00，但如果因为某种原因有数据，也应该处理掉。
-	// 这里假设 Unmarshal 已经处理了 Extra Data 的长度读取，如果 Opt 0x00，则没有 Extra Data。
-	// 如果 Unmarshal 没处理，这里需要显式地跳过 Extra Data。
-	// 根据 frame.go 的 Unmarshal 逻辑，它只处理 metadata，Extra Data 需要后续读取。
-	// 但 KeepAlive 帧不应有 Extra Data，所以这里不需要额外处理 Extra Data。
 	return nil
 }
 
@@ -463,9 +459,10 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 
 	s, found := m.sessionManager.Get(meta.SessionID)
 	if !found {
-		closingWriter := NewResponseWriter(meta.SessionID, m.link.Writer, protocol.TransferTypeStream)
-		closingWriter.SetErrorCode(ErrorCodeProtocolError) // 修正: 使用 SetErrorCode
-		closingWriter.Close() // 修正: 不再传入错误码
+		// 修正: 传入 session 参数
+		closingWriter := NewResponseWriter(meta.SessionID, m.link.Writer, protocol.TransferTypeStream, nil) // 对于未知会话，session 可以为 nil
+		closingWriter.SetErrorCode(ErrorCodeProtocolError)
+		closingWriter.Close()
 		return buf.Copy(NewStreamReader(reader), buf.Discard)
 	}
 
@@ -473,9 +470,10 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	err := buf.Copy(rr, s.output) // 将数据从 Mux Reader 复制到会话输出流
 	if err != nil && buf.IsWriteError(err) {
 		newError("failed to write to downstream. closing session ", s.ID).Base(err).WriteToLog()
-		closingWriter := NewResponseWriter(meta.SessionID, m.link.Writer, protocol.TransferTypeStream)
-		closingWriter.SetErrorCode(ErrorCodeProtocolError) // 修正: 使用 SetErrorCode
-		closingWriter.Close() // 修正: 不再传入错误码
+		// 修正: 传入 session 参数
+		closingWriter := NewResponseWriter(meta.SessionID, m.link.Writer, protocol.TransferTypeStream, s)
+		closingWriter.SetErrorCode(ErrorCodeProtocolError)
+		closingWriter.Close()
 		drainErr := buf.Copy(rr, buf.Discard) // 丢弃剩余数据
 		common.Interrupt(s.input)
 		s.Close()
