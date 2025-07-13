@@ -5,6 +5,9 @@ import (
 	"context"
 	"encoding/binary"
 	"io"
+	"sync" // For sync.Map
+	"sync/atomic" // For atomic operations on int64
+	"time"
 
 	core "github.com/v2fly/v2ray-core/v5"
 	"github.com/v2fly/v2ray-core/v5/common"
@@ -71,28 +74,81 @@ func (s *Server) Close() error {
 	return nil
 }
 
+// udpMappingEntry stores the original source and last activity time for a GlobalID.
+type udpMappingEntry struct {
+	OriginalSource net.Destination
+	LastActivity   int64 // UnixNano timestamp, will be accessed atomically
+}
+
+const UDPGlobalIDTTL = time.Minute * 2         // 2 minutes TTL for UDP GlobalID mappings
+const UDPGlobalIDCleanupInterval = time.Second * 30 // Cleanup every 30 seconds
+
 // ServerWorker represents the server side of a Mux main connection.
 type ServerWorker struct {
 	dispatcher     routing.Dispatcher
 	link           *transport.Link
 	sessionManager *SessionManager
+	// Mux.Pro: For UDP FullCone NAT mapping
+	udpGlobalIDMap    sync.Map // map[GlobalID]*udpMappingEntry
+	cancelCleanupCtx  context.CancelFunc
 }
 
 // NewServerWorker creates a new ServerWorker.
 func NewServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.Link) (*ServerWorker, error) {
+	cleanupCtx, cancel := context.WithCancel(ctx)
 	worker := &ServerWorker{
 		dispatcher:     d,
 		link:           link,
 		sessionManager: NewSessionManager(),
+		cancelCleanupCtx: cancel,
 	}
-	go worker.run(ctx) // Start the main loop
+	go worker.run(ctx)
+	go worker.cleanupUDPGlobalIDMap(cleanupCtx) // Start cleanup goroutine
 	return worker, nil
+}
+
+// cleanupUDPGlobalIDMap periodically cleans up expired UDP GlobalID mappings.
+func (w *ServerWorker) cleanupUDPGlobalIDMap(ctx context.Context) {
+	ticker := time.NewTicker(UDPGlobalIDCleanupInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			newError("UDP GlobalID map cleanup goroutine stopped.").WriteToLog()
+			return
+		case <-ticker.C:
+			now := time.Now().UnixNano()
+			w.udpGlobalIDMap.Range(func(key, value interface{}) bool {
+				globalID := key.(GlobalID)
+				entry := value.(*udpMappingEntry)
+				// Access LastActivity atomically
+				if time.Duration(now - atomic.LoadInt64(&entry.LastActivity)) > UDPGlobalIDTTL {
+					newError("cleaning up expired UDP GlobalID mapping: ", globalID).WriteToLog()
+					w.udpGlobalIDMap.Delete(globalID)
+				}
+				return true
+			})
+		}
+	}
 }
 
 // handle handles data forwarding for sub-connections.
 func handle(ctx context.Context, s *Session, output buf.Writer) {
-	// Pass a zero GlobalID for now; actual GlobalID will be extracted from New frame in future stages
-	writer := NewResponseWriter(s.ID, output, s.transferType, s, GlobalID{})
+	var packetDest *net.Destination // This will be the actual destination for UDP packets sent back to client
+
+	// For UDP responses, the destination is the client's original source address.
+	// This original source is stored in the Session struct (s.originalSource)
+	// and also managed in the ServerWorker's udpGlobalIDMap via s.globalID.
+	if s.transferType == protocol.TransferTypePacket && s.originalSource.IsValid() {
+		packetDest = &s.originalSource
+		newError("server sending UDP response to original source: ", *packetDest, " for GlobalID: ", s.globalID).WriteToLog()
+	}
+
+	// Pass the packetDest to NewResponseWriter, which will then pass it to Writer.writeDataInternal
+	writer := NewResponseWriter(s.ID, output, s.transferType, s, s.globalID) // Pass s.globalID
+	writer.SetPacketDestination(packetDest) // Set the specific packet destination for UDP responses
+
 	if err := buf.Copy(s.input, writer); err != nil { // buf.Copy returns only error
 		newError("session ", s.ID, " ends.").Base(err).WriteToLog(session.ExportIDToError(ctx))
 		writer.SetErrorCode(ErrorCodeProtocolError)
@@ -285,6 +341,18 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 	}
 	if meta.Target.Network == net.Network_UDP {
 		s.transferType = protocol.TransferTypePacket
+		// Mux.Pro: Store GlobalID and original source for UDP FullCone NAT
+		inbound := session.InboundFromContext(ctx)
+		if inbound != nil && inbound.Source.IsValid() {
+			s.originalSource = inbound.Source
+			s.globalID = meta.GlobalID // GlobalID is already parsed from New frame metadata
+			// Add/update mapping in the concurrent map
+			w.udpGlobalIDMap.Store(s.globalID, &udpMappingEntry{
+				OriginalSource: inbound.Source,
+				LastActivity:   time.Now().UnixNano(), // Set initial timestamp
+			})
+			newError("stored UDP GlobalID mapping: ", s.globalID, " -> ", s.originalSource).WriteToLog()
+		}
 	}
 	w.sessionManager.Add(s)
 	go handle(ctx, s, w.link.Writer) // Start data forwarding for sub-connection
@@ -311,9 +379,16 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	if !found {
 		// Determine transferType for closingWriter based on the incoming frame's target
 		tt := protocol.TransferTypeStream
-		if meta.Target.Network == net.Network_UDP { // If the original frame's target was UDP
+		// If the incoming frame's target was UDP (which is not directly in meta for Keep frames,
+		// but derived from the session's transferType if it's a UDP session).
+		// We assume if the session is not found, we can't know its original transfer type reliably,
+		// so default to stream or try to infer from OptionUDPData if present.
+		// For now, if session not found, we can't know if it was UDP or TCP, so default to stream.
+		// If OptionUDPData is set, it implies UDP.
+		if meta.Option.Has(OptionUDPData) {
 			tt = protocol.TransferTypePacket
 		}
+
 		// Pass the GlobalID from the incoming frame's metadata to the closingWriter
 		closingWriter := NewResponseWriter(meta.SessionID, w.link.Writer, tt, nil, meta.GlobalID)
 		closingWriter.SetErrorCode(ErrorCodeProtocolError)
@@ -321,9 +396,64 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 		return buf.Copy(NewStreamReader(reader), buf.Discard) // Discard remaining data
 	}
 
+	var udpSrc net.Destination
+	var globalID GlobalID
+	var err error
+
+	// Mux.Pro: If OptionUDPData is set, parse UDP source address and GlobalID from Extra Data.
+	if meta.Option.Has(OptionUDPData) {
+		udpSrc, globalID, err = readUDPMetaData(reader) // This reads from Extra Data
+		if err != nil {
+			newError("failed to read UDP metadata for session ", s.ID).Base(err).WriteToLog()
+			// If metadata parsing fails, discard the remaining data and close session.
+			closingWriter := NewResponseWriter(meta.SessionID, w.link.Writer, protocol.TransferTypeStream, nil, GlobalID{})
+			closingWriter.SetErrorCode(ErrorCodeProtocolError)
+			closingWriter.Close()
+			return buf.Copy(NewStreamReader(reader), buf.Discard)
+		}
+		newError("received UDP data for session ", s.ID, " from ", udpSrc, " GlobalID: ", globalID).WriteToLog()
+
+		// Update the GlobalID mapping with the latest activity and source
+		if entryVal, loaded := w.udpGlobalIDMap.Load(globalID); loaded {
+			existingEntry := entryVal.(*udpMappingEntry)
+			// Update LastActivity atomically
+			atomic.StoreInt64(&existingEntry.LastActivity, time.Now().UnixNano())
+			// Only update OriginalSource if it's different.
+			// Compare Address and Port fields manually.
+			addressesEqual := false
+			// Correctly use Family() method on the Address interface
+			if existingEntry.OriginalSource.Address.Family() == udpSrc.Address.Family() {
+				if existingEntry.OriginalSource.Address.Family().IsIP() { // Corrected: Call IsIP on AddressFamily
+					// For IP addresses, use net.IP.Equal
+					if existingEntry.OriginalSource.Address.IP().Equal(udpSrc.Address.IP()) {
+						addressesEqual = true
+					}
+				} else if existingEntry.OriginalSource.Address.Family().IsDomain() { // Corrected: Call IsDomain on AddressFamily
+					// For domain addresses, compare strings
+					if existingEntry.OriginalSource.Address.Domain() == udpSrc.Address.Domain() {
+						addressesEqual = true
+					}
+				}
+			}
+
+			if !addressesEqual || existingEntry.OriginalSource.Port != udpSrc.Port {
+				existingEntry.OriginalSource = udpSrc
+				newError("updated UDP GlobalID mapping for ", globalID, " to new source: ", udpSrc).WriteToLog()
+			}
+		} else {
+			// If not loaded, store it. This might happen if a Keep frame arrives before New frame (protocol error),
+			// or if the mapping was cleaned up but the session is still active.
+			w.udpGlobalIDMap.Store(globalID, &udpMappingEntry{
+				OriginalSource: udpSrc,
+				LastActivity:   time.Now().UnixNano(),
+			})
+			newError("created new UDP GlobalID mapping from Keep frame: ", globalID, " -> ", udpSrc).WriteToLog()
+		}
+	}
+
 	rr := s.NewReader(reader)
 	var sc buf.SizeCounter // Declare a buf.SizeCounter instance
-	err := buf.Copy(rr, s.output, buf.CountSize(&sc)) // Call buf.Copy and pass CountSize option
+	err = buf.Copy(rr, s.output, buf.CountSize(&sc)) // Call buf.Copy and pass CountSize option
 	copiedBytes := sc.Size // Get copied bytes from SizeCounter
 
 	if err != nil && buf.IsWriteError(err) {
@@ -379,7 +509,12 @@ func (w *ServerWorker) handleStatusEnd(meta *FrameMetadata, reader *buf.Buffered
 			common.Interrupt(s.input)
 			common.Interrupt(s.output)
 		}
-		s.Close()
+		// If the session has a GlobalID, remove it from the map upon session closure
+		if s.globalID != (GlobalID{}) {
+			w.udpGlobalIDMap.Delete(s.globalID)
+			newError("removed UDP GlobalID mapping for session ", s.ID, " GlobalID: ", s.globalID).WriteToLog()
+		}
+		s.Close() // This will also remove the session from sessionManager
 	}
 	if meta.Option.Has(OptionData) { // If End frame unexpectedly contains data, discard it
 		return buf.Copy(NewStreamReader(reader), buf.Discard)
@@ -426,6 +561,7 @@ func (w *ServerWorker) run(ctx context.Context) {
 	reader := &buf.BufferedReader{Reader: input}
 
 	defer w.sessionManager.Close()
+	defer w.cancelCleanupCtx() // Ensure cleanup goroutine is cancelled when worker stops
 
 	// Mux.Pro: Perform version negotiation first, before processing any other frames.
 	if err := w.negotiate(reader); err != nil {
