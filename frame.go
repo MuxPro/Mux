@@ -38,8 +38,14 @@ const (
 	// For NegotiateVersion and CreditUpdate frames, indicates Extra Data presence.
 	OptionData bitmask.Byte = 0x01
 
-	// OptionError (0x02): Used in Mux.Cool to indicate error, replaced by ErrorCode in Mux.Pro.
-	OptionError bitmask.Byte = 0x02 // Deprecated in Mux.Pro
+	// OptionUDPData (0x02): Mux.Pro extension for Keep frames.
+	// If set, indicates that the Extra Data for a Keep frame starts with
+	// UDP address/port information, followed by actual UDP payload.
+	OptionUDPData bitmask.Byte = 0x02
+
+	// OptionError (0x04): Used in Mux.Cool to indicate error, replaced by ErrorCode in Mux.Pro.
+	// Note: Renamed from 0x02 to 0x04 to avoid conflict with OptionUDPData.
+	OptionError bitmask.Byte = 0x04 // Deprecated in Mux.Pro
 )
 
 // ErrorCode defines error codes in Mux.Pro End frames.
@@ -95,9 +101,11 @@ type FrameMetadata struct {
 	SessionStatus SessionStatus
 
 	// Mux.Pro specific fields
-	Priority  byte   // Used in New frames
-	ErrorCode uint16 // Used in End frames
-	GlobalID  GlobalID // Mux.Pro: Used in New frames for UDP FullCone NAT
+	Priority  byte     // Used in New frames
+	ErrorCode uint16   // Used in End frames
+	GlobalID  GlobalID // Mux.Pro: Used in New frames for UDP FullCone NAT (client to server)
+	// Note: SourceAddress and SourcePort are NOT part of FrameMetadata for Keep frames.
+	// They are part of the Extra Data payload when OptionUDPData is set.
 }
 
 // WriteTo serializes the metadata into the buffer.
@@ -126,7 +134,7 @@ func (f *FrameMetadata) WriteTo(b *buf.Buffer) error {
 			return err
 		}
 		// Mux.Pro: If UDP, write GlobalID
-		if f.Target.Network == net.Network_UDP && f.GlobalID != [8]byte{} {
+		if f.Target.Network == net.Network_UDP && f.GlobalID != (GlobalID{}) {
 			Must2(b.Write(f.GlobalID[:]))
 		}
 	case SessionStatusEnd:
@@ -136,6 +144,9 @@ func (f *FrameMetadata) WriteTo(b *buf.Buffer) error {
 				return err
 			}
 		}
+	case SessionStatusKeep:
+		// No additional fixed metadata fields for Keep frames.
+		// UDP address/port and GlobalID for Keep frames are in Extra Data.
 	}
 
 	len1 := b.Len()
@@ -176,7 +187,7 @@ func (f *FrameMetadata) UnmarshalFromBuffer(b *buf.Buffer) error {
 	// Set default values
 	f.Target.Network = net.Network_Unknown
 	f.ErrorCode = ErrorCodeGracefulShutdown
-	f.GlobalID = [8]byte{} // Initialize GlobalID to zero
+	f.GlobalID = GlobalID{} // Initialize GlobalID to zero
 
 	switch f.SessionStatus {
 	case SessionStatusNew:
@@ -216,6 +227,10 @@ func (f *FrameMetadata) UnmarshalFromBuffer(b *buf.Buffer) error {
 			f.ErrorCode = binary.BigEndian.Uint16(b.Bytes())
 			b.Advance(2)
 		}
+	case SessionStatusKeep:
+		// No additional fixed metadata fields for Keep frames.
+		// UDP address/port and GlobalID for Keep frames are in Extra Data,
+		// and will be handled by the reader (e.g., client.go/server.go's handleStatusKeep).
 	}
 
 	return nil
