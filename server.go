@@ -177,7 +177,7 @@ func (w *ServerWorker) negotiate(reader *buf.BufferedReader) error {
 	common.Must(WriteUint32(versionsPayload, negotiatedVersion))
 
 	Must2(serial.WriteUint16(frame, uint16(versionsPayload.Len())))
-	WriteAll(versionsPayload.Bytes())
+	Must2(frame.Write(versionsPayload.Bytes())) 
 
 	if err := w.link.Writer.WriteMultiBuffer(buf.MultiBuffer{frame}); err != nil {
 		return newError("failed to write negotiation response").Base(err)
