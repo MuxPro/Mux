@@ -53,12 +53,6 @@ type WorkerPicker interface {
 	Release(ClientWorker)
 }
 
-type ClientWorker interface {
-	Dispatch(context.Context, *transport.Link) error
-	IsFull() bool
-	IsClosing() bool
-}
-
 type ClientWorkerFactory interface {
 	Create() (ClientWorker, error)
 }
@@ -141,16 +135,36 @@ func (f *DialingWorkerFactory) Create() (ClientWorker, error) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	link, err := f.Proxy.Process(ctx, transport.With =session.NewOutbound(dest)), internet.Dial(ctx, dest)
+
+	// Dial the actual underlying connection to the Mux.Pro server
+	conn, err := internet.Dial(ctx, dest)
 	if err != nil {
 		cancel()
-		return nil, newError("failed to dial to ", dest).Base(err)
+		return nil, newError("failed to dial Mux.Pro server to ", dest).Base(err)
 	}
 
-	worker := NewClientWorker(link, ClientStrategy{MaxConcurrency: 8, MaxConnection: 1}) // Example strategy
+	// Create a transport.Link from the established net.Conn
+	// uplinkPipe is the pipe.Reader part that reads from net.Conn (what ClientWorker writes to)
+	// downlinkPipe is the pipe.Writer part that writes to net.Conn (what ClientWorker reads from)
+	uplinkPipe, downlinkPipe := pipe.New(pipe.WithContext(ctx))
+
+	go func() {
+		defer common.Close(conn)
+		defer common.Close(uplinkPipe.Writer) // Close writer when net.Conn copy is done
+		defer common.Close(downlinkPipe.Reader) // Close reader when net.Conn copy is done
+
+		// Copy data from the pipe (what ClientWorker writes) to the net.Conn
+		common.Copy(uplinkPipe.Reader, conn)
+		// Copy data from the net.Conn to the pipe (what ClientWorker reads)
+		common.Copy(conn, downlinkPipe.Writer)
+	}()
+
+	// NewClientWorker needs the 'downlinkPipe' as its communication link to the remote Mux server
+	worker := NewClientWorker(downlinkPipe, ClientStrategy{MaxConcurrency: 8, MaxConnection: 1}) // Example strategy
 	go func() {
 		defer cancel()
 		<-worker.(*clientWorker).done.Done() // Wait for worker to close
+		// The underlying net.Conn is closed by the goroutine above
 	}()
 
 	return worker, nil
