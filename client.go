@@ -21,6 +21,13 @@ import (
 	"github.com/v2fly/v2ray-core/v5/transport/pipe"
 )
 
+// ClientWorker is an interface for a Mux client worker handling multiple sessions.
+type ClientWorker interface {
+	Dispatch(ctx context.Context, link *transport.Link) error
+	IsFull() bool
+	IsClosing() bool
+}
+
 type ClientManager struct {
 	Enabled bool // whether mux is enabled from user config
 	Picker  WorkerPicker
@@ -400,7 +407,7 @@ func (m *clientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	if err != nil {
 		newError("Client: Failed to write data for session ", meta.SessionID).Base(err).WriteToLog(log.DefaultLogger())
 		// Mux.Pro: Client received error from application. Send End frame.
-		common.Close(NewResponseWriter(s.ID, m.link.Writer, s.transferType).Close(ErrorCodeRemoteDisconnect))
+		common.Close(NewResponseWriter(s.ID, m.link.Writer, protocol.TransferTypeStream).Close(ErrorCodeRemoteDisconnect))
 		s.Close() // Close local session too
 		return err
 	}
