@@ -1,4 +1,4 @@
-package common
+package mux
 
 // Must panics if the given error is not nil.
 // 这是 V2Ray 中常见的错误处理模式，用于简化代码。
