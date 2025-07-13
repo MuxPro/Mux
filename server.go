@@ -93,11 +93,12 @@ func handle(ctx context.Context, s *Session, output buf.Writer) {
 	writer := NewResponseWriter(s.ID, output, s.transferType)
 	if err := buf.Copy(s.input, writer); err != nil {
 		newError("session ", s.ID, " ends.").Base(err).WriteToLog(session.ExportIDToError(ctx))
-		writer.Close(ErrorCodeProtocolError) // Mux.Pro: 发生错误时关闭，带上错误码
+		writer.SetErrorCode(ErrorCodeProtocolError) // 修正: 使用 SetErrorCode
+		writer.Close() // 修正: 不再传入错误码
 		return
 	}
 
-	writer.Close(ErrorCodeGracefulShutdown) // Mux.Pro: 正常关闭
+	writer.Close() // 修正: 不再传入错误码，默认是 GracefulShutdown
 	s.Close()
 }
 
@@ -271,7 +272,8 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	s, found := w.sessionManager.Get(meta.SessionID)
 	if !found {
 		closingWriter := NewResponseWriter(meta.SessionID, w.link.Writer, protocol.TransferTypeStream)
-		closingWriter.Close() // 关闭一个不存在的会话
+		closingWriter.SetErrorCode(ErrorCodeProtocolError) // 修正: 使用 SetErrorCode
+		closingWriter.Close() // 修正: 不再传入错误码
 		return buf.Copy(NewStreamReader(reader), buf.Discard)
 	}
 
@@ -280,7 +282,8 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	if err != nil && buf.IsWriteError(err) {
 		newError("failed to write to downstream writer. closing session ", s.ID).Base(err).WriteToLog()
 		closingWriter := NewResponseWriter(meta.SessionID, w.link.Writer, protocol.TransferTypeStream)
-		closingWriter.Close()
+		closingWriter.SetErrorCode(ErrorCodeProtocolError) // 修正: 使用 SetErrorCode
+		closingWriter.Close() // 修正: 不再传入错误码
 		drainErr := buf.Copy(rr, buf.Discard) // 丢弃剩余数据
 		common.Interrupt(s.input)
 		s.Close()
