@@ -233,7 +233,7 @@ func (m *ClientWorker) NegotiateAndStart() error {
 	// 构造版本协商的 Extra Data
 	versionsPayload := buf.New()
 	common.Must(versionsPayload.WriteByte(1))                 // 版本数量 N = 1
-	common.Must(serial.WriteUint32(versionsPayload, Version)) // 版本号
+	common.Must(WriteUint32(versionsPayload, Version)) // 版本号
 	defer versionsPayload.Release()
 
 	// 写入 Extra Data 的长度和内容
