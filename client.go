@@ -238,7 +238,7 @@ func (m *ClientWorker) NegotiateAndStart() error {
 
 	// 写入 Extra Data 的长度和内容
 	Must2(serial.WriteUint16(frame, uint16(versionsPayload.Len())))
-	frame.WriteAll(versionsPayload.Bytes())
+	WriteAll(versionsPayload.Bytes())
 
 	if err := m.link.Writer.WriteMultiBuffer(buf.MultiBuffer{frame}); err != nil {
 		return newError("failed to write negotiation request").Base(err)
