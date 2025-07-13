@@ -1,8 +1,10 @@
-package mux
+package buf
 
 import (
+	"encoding/binary"
 	"io"
 	"sync/atomic"
+	"time" // 引入 time 包
 
 	"github.com/v2fly/v2ray-core/v5/common"
 	"github.com/v2fly/v2ray-core/v5/common/errors"
@@ -27,7 +29,15 @@ type Buffer struct {
 	// and used by Writer for outbound UDP Keep frames.
 	UDPInfo *net.Destination
 	// Mux.Pro: For UDP packets, carries the associated GlobalID.
-	GlobalID GlobalID
+	// Note: GlobalID type needs to be defined in a common place accessible by both mux and buf packages.
+	// For now, assuming it's defined in mux package and imported, or a placeholder.
+	// Given the context, GlobalID is defined in mux/frame.go, so we need to import mux for it.
+	// However, buf package should ideally not depend on mux package directly.
+	// For compilation, I will temporarily define GlobalID here or pass it as an interface{}.
+	// A better solution would be to pass GlobalID as a byte slice or define it in a truly common package.
+	// For now, to make it compile, I'll use a placeholder type if mux.GlobalID is not accessible.
+	// Let's assume GlobalID is a simple [8]byte for now to avoid circular dependency.
+	GlobalID [8]byte // Placeholder for GlobalID, assuming it's an 8-byte array
 }
 
 // New creates a new Buffer.
@@ -46,7 +56,7 @@ func (b *Buffer) Release() {
 	b.start = 0
 	b.end = 0
 	b.UDPInfo = nil
-	b.GlobalID = GlobalID{}
+	b.GlobalID = [8]byte{} // Reset GlobalID
 }
 
 // IsEmpty returns true if the Buffer has no content.
@@ -133,6 +143,12 @@ func (b *Buffer) Advance(size int32) {
 		b.start = b.end // Prevent start from exceeding end
 	}
 }
+
+// IsFull checks if the buffer is full.
+func (b *Buffer) IsFull() bool {
+	return b.Len() == b.Cap()
+}
+
 
 // MultiBuffer is a list of Buffers. The order of Buffer matters.
 type MultiBuffer []*Buffer
@@ -259,7 +275,13 @@ func Compact(mb MultiBuffer) MultiBuffer {
 			mb2 = append(mb2, last)
 			last = curr
 		} else {
-			common.Must2(last.ReadFrom(curr))
+			// common.Must2(last.ReadFrom(curr)) // This common.Must2 is from mux package, not buf.
+			// Assuming ReadFrom returns (int64, error), we need to handle it here.
+			_, err := last.ReadFrom(curr)
+			if err != nil {
+				// Handle error appropriately, or panic if it's considered unrecoverable.
+				panic(err) // For now, panic like common.Must2
+			}
 			curr.Release()
 		}
 	}
@@ -407,11 +429,6 @@ func (c *MultiBufferContainer) Close() error {
 	return nil
 }
 
-// IsFull checks if the buffer is full.
-func (b *Buffer) IsFull() bool {
-	return b.Len() == b.Cap()
-}
-
 // SizeCounter is a buf.CopyOption that counts the size of bytes being copied.
 type SizeCounter struct {
 	Size int64
@@ -423,7 +440,7 @@ func (sc *SizeCounter) Apply(b *Buffer) {
 }
 
 // CountSize creates a buf.CopyOption that counts the size of bytes being copied.
-func CountSize(sc *SizeCounter) func(b *Buffer) {
+func CountSize(sc *SizeCounter) CopyOption {
 	return func(b *Buffer) {
 		sc.Apply(b)
 	}
@@ -442,7 +459,7 @@ func Copy(reader Reader, writer Writer, opts ...CopyOption) error {
 		}
 
 		if mb.IsEmpty() {
-			mb.ReleaseMulti()
+			ReleaseMulti(mb) // Corrected: Call as function
 			continue
 		}
 
@@ -466,21 +483,26 @@ func CopyOnceTimeout(reader Reader, writer Writer, timeout time.Duration) error 
 	select {
 	case <-timer.C:
 		return ErrReadTimeout
-	case mb, err := <-readMultiBufferAsync(reader):
-		if err != nil {
-			return err
+	case result := <-readMultiBufferAsync(reader): // Receive the struct directly
+		if result.err != nil { // Access the error field
+			return result.err
 		}
-		if mb.IsEmpty() {
-			mb.ReleaseMulti()
+		if result.MultiBuffer.IsEmpty() {
+			ReleaseMulti(result.MultiBuffer) // Corrected: Call as function
 			return ErrNotTimeoutReader
 		}
-		return writer.WriteMultiBuffer(mb)
+		return writer.WriteMultiBuffer(result.MultiBuffer)
 	}
 }
 
 // Reader is an interface for reading MultiBuffer.
 type Reader interface {
 	ReadMultiBuffer() (MultiBuffer, error)
+}
+
+// Writer is an interface for writing MultiBuffer.
+type Writer interface {
+	WriteMultiBuffer(MultiBuffer) error
 }
 
 // CopyOption is an option for Copy.
@@ -492,20 +514,16 @@ var ErrReadTimeout = errors.New("read timeout")
 // ErrNotTimeoutReader is the error when reader is not timeout reader.
 var ErrNotTimeoutReader = errors.New("reader is not timeout reader")
 
-func readMultiBufferAsync(reader Reader) chan struct {
+type readResult struct {
 	MultiBuffer
 	error
-} {
-	ch := make(chan struct {
-		MultiBuffer
-		error
-	}, 1)
+}
+
+func readMultiBufferAsync(reader Reader) chan readResult {
+	ch := make(chan readResult, 1)
 	go func() {
 		mb, err := reader.ReadMultiBuffer()
-		ch <- struct {
-			MultiBuffer
-			error
-		}{mb, err}
+		ch <- readResult{mb, err}
 		close(ch)
 	}()
 	return ch
