@@ -492,6 +492,9 @@ func (m *ClientWorker) handleStatueKeepAlive(meta *FrameMetadata, reader *buf.Bu
 func (m *ClientWorker) handleStatusNew(meta *FrameMetadata, reader *buf.BufferedReader) error {
 	// Client should not receive New frames. If received, treat as protocol error and discard data.
 	if meta.Option.Has(OptionData) {
+		// If it's a UDP New frame with GlobalID, we might need to extract it,
+		// but the prompt says client should not receive New frames.
+		// So we just discard the data.
 		return buf.Copy(NewStreamReader(reader), buf.Discard)
 	}
 	return nil
@@ -530,34 +533,92 @@ func (m *ClientWorker) handleCreditUpdate(meta *FrameMetadata, reader *buf.Buffe
 	return nil
 }
 
+// udpDataInjectingReader is a buf.Reader wrapper that injects UDP metadata into the first buffer.
+// This is used when a Mux Keep frame (SessionStatusKeep) contains OptionUDPData,
+// indicating that the payload is a UDP packet and its source address is in the Extra Data.
+type udpDataInjectingReader struct {
+	buf.Reader
+	udpDest  net.Destination
+	globalID GlobalID
+	injected bool // Flag to ensure UDP metadata is injected only once per packet
+}
+
+// ReadMultiBuffer implements buf.Reader.
+func (u *udpDataInjectingReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+	mb, err := u.Reader.ReadMultiBuffer()
+	if err != nil {
+		return nil, err
+	}
+
+	if !u.injected && len(mb) > 0 {
+		// Assign the parsed UDP destination to the first buffer's UDP field.
+		// This ensures the downstream application receives the correct UDP source for the packet.
+		mb[0].UDP = &u.udpDest
+		// The GlobalID is for session identification and is not directly put on the buffer.
+		// It's associated with the session itself.
+		u.injected = true
+	}
+	return mb, nil
+}
+
 
 // handleStatusKeep handles Keep frames (data transfer).
 func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.BufferedReader) error {
-	if !meta.Option.Has(OptionData) {
+	if !meta.Option.Has(OptionData) { // OptionData must be set for any payload or Extra Data
 		return nil
 	}
 
 	s, found := m.sessionManager.Get(meta.SessionID)
 	if !found {
-		// Pass a zero GlobalID for now; actual GlobalID will be extracted from Keep frame in future stages
-		closingWriter := NewResponseWriter(meta.SessionID, m.link.Writer, protocol.TransferTypeStream, nil, GlobalID{}) 
+		// If session not found, discard the entire frame.
+		closingWriter := NewResponseWriter(meta.SessionID, m.link.Writer, protocol.TransferTypeStream, nil, GlobalID{})
 		closingWriter.SetErrorCode(ErrorCodeProtocolError)
 		closingWriter.Close()
 		return buf.Copy(NewStreamReader(reader), buf.Discard)
 	}
 
+	var udpSrc net.Destination
+	var globalID GlobalID
+	var err error
+
+	// Mux.Pro: If OptionUDPData is set, parse UDP source address and GlobalID from Extra Data.
+	if meta.Option.Has(OptionUDPData) {
+		udpSrc, globalID, err = readUDPMetaData(reader) // Use the helper function from reader.go
+		if err != nil {
+			newError("failed to read UDP metadata for session ", s.ID).Base(err).WriteToLog()
+			// If metadata parsing fails, discard the remaining data and close session.
+			closingWriter := NewResponseWriter(meta.SessionID, m.link.Writer, protocol.TransferTypeStream, nil, GlobalID{})
+			closingWriter.SetErrorCode(ErrorCodeProtocolError)
+			closingWriter.Close()
+			return buf.Copy(NewStreamReader(reader), buf.Discard)
+		}
+		newError("received UDP data for session ", s.ID, " from ", udpSrc, " GlobalID: ", globalID).WriteToLog()
+	}
+
+	// Create the underlying reader for the actual payload data.
 	rr := s.NewReader(reader)
-	var sc buf.SizeCounter // Declare a buf.SizeCounter instance
-	err := buf.Copy(rr, s.output, buf.CountSize(&sc)) // Call buf.Copy and pass CountSize option
-	copiedBytes := sc.Size // Get copied bytes from SizeCounter
+
+	// If UDP data was present, wrap the reader to inject the UDP metadata into the first buffer.
+	if meta.Option.Has(OptionUDPData) {
+		rr = &udpDataInjectingReader{
+			Reader:   rr,
+			udpDest:  udpSrc,
+			globalID: globalID,
+			injected: false,
+		}
+	}
+
+	var sc buf.SizeCounter
+	// buf.Copy will now use the potentially wrapped 'rr', which sets the UDP field on the first buffer.
+	err = buf.Copy(rr, s.output, buf.CountSize(&sc))
+	copiedBytes := sc.Size
 
 	if err != nil && buf.IsWriteError(err) {
 		newError("failed to write to downstream. closing session ", s.ID).Base(err).WriteToLog()
-		// Pass a zero GlobalID for now
 		closingWriter := NewResponseWriter(meta.SessionID, m.link.Writer, protocol.TransferTypeStream, s, GlobalID{})
 		closingWriter.SetErrorCode(ErrorCodeProtocolError)
 		closingWriter.Close()
-		drainErr := buf.Copy(rr, buf.Discard) // Discard remaining data
+		drainErr := buf.Copy(rr, buf.Discard)
 		common.Interrupt(s.input)
 		s.Close()
 		return drainErr
