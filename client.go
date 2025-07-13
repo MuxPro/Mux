@@ -370,7 +370,7 @@ func GetGlobalID(ctx context.Context) (globalID GlobalID) {
 	// Check if the inbound connection is UDP and from a relevant handler
 	inbound := session.InboundFromContext(ctx)
 	if inbound != nil && inbound.Source.Network == net.Network_UDP &&
-		(inbound.Tag == "dokodemo-door" || inbound.Tag == "socks" || inbound.Tag == "shadowsocks") { // Corrected: inbound.Name to inbound.Tag
+		(inbound.Tag == "dokodemo-door" || inbound.Tag == "socks" || inbound.Tag == "shadowsocks") {
 		
 		// Use a fixed BaseKey for demonstration. In a real system, this might be
 		// securely generated and persisted.
@@ -418,7 +418,7 @@ func fetchInput(ctx context.Context, s *Session, output buf.Writer) {
 	}
 
 	// Mux.Pro: Pass priority and GlobalID
-	writer := NewWriter(s.ID, dest, output, transferType, 0x00, s, globalID) // Corrected: Added globalID argument
+	writer := NewWriter(s.ID, dest, output, transferType, 0x00, s, globalID)
 	defer s.Close()
 	defer writer.Close()
 
@@ -539,7 +539,8 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 
 	s, found := m.sessionManager.Get(meta.SessionID)
 	if !found {
-		closingWriter := NewResponseWriter(meta.SessionID, m.link.Writer, protocol.TransferTypeStream, nil) // For unknown sessions, session can be nil
+		// Pass a zero GlobalID for now; actual GlobalID will be extracted from Keep frame in future stages
+		closingWriter := NewResponseWriter(meta.SessionID, m.link.Writer, protocol.TransferTypeStream, nil, GlobalID{}) 
 		closingWriter.SetErrorCode(ErrorCodeProtocolError)
 		closingWriter.Close()
 		return buf.Copy(NewStreamReader(reader), buf.Discard)
@@ -552,7 +553,8 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 
 	if err != nil && buf.IsWriteError(err) {
 		newError("failed to write to downstream. closing session ", s.ID).Base(err).WriteToLog()
-		closingWriter := NewResponseWriter(meta.SessionID, m.link.Writer, protocol.TransferTypeStream, s)
+		// Pass a zero GlobalID for now
+		closingWriter := NewResponseWriter(meta.SessionID, m.link.Writer, protocol.TransferTypeStream, s, GlobalID{})
 		closingWriter.SetErrorCode(ErrorCodeProtocolError)
 		closingWriter.Close()
 		drainErr := buf.Copy(rr, buf.Discard) // Discard remaining data
@@ -661,3 +663,4 @@ func (m *ClientWorker) fetchOutput() {
 		}
 	}
 }
+
