@@ -6,34 +6,10 @@ import (
 
 	"github.com/v2fly/v2ray-core/v5/common"
 	"github.com/v2fly/v2ray-core/v5/common/buf"
-	"github.com/v2fly/v2ray-core/v5/common/errors"
 	"github.com/v2fly/v2ray-core/v5/common/net"
 	"github.com/v2fly/v2ray-core/v5/common/protocol"
 	"github.com/v2fly/v2ray-core/v5/common/serial"
 )
-
-// Assuming these are defined elsewhere in the mux package (e.g., frame.go)
-// type FrameMetadata struct { ... }
-// type Option byte
-// const (
-//     OptionData Option = 0x01
-//     OptionUDPData Option = 0x02 // Mux.Pro: New option for UDP data
-// )
-// const (
-//     SessionStatusNew SessionStatus = 0x01
-//     SessionStatusKeep SessionStatus = 0x02
-//     SessionStatusEnd SessionStatus = 0x03
-// )
-// const (
-//     ErrorCodeGracefulShutdown uint16 = 0x0000
-//     ErrorCodeProtocolError uint16 = 0x0001
-// )
-// type GlobalID [8]byte
-// type TargetNetwork byte
-// const TargetNetworkUDP TargetNetwork = 0x02
-
-// Assuming addrParser is available for writing address and port.
-// var addrParser = &protocol.AddressPortParser{} // Example, actual implementation may vary.
 
 // Writer is responsible for packaging application layer data into Mux frames.
 type Writer struct {
@@ -130,24 +106,6 @@ func (w *Writer) getNextFrameMeta() FrameMetadata {
 	return meta
 }
 
-// writeMetaWithFrame writes metadata and a payload (Extra Data or actual data).
-// writer: The underlying buf.Writer.
-// meta: The FrameMetadata to be written.
-// payload: The actual data payload (can be Extra Data or application data).
-func writeMetaWithFrame(writer buf.Writer, meta FrameMetadata, payload buf.MultiBuffer) error {
-	frame := buf.New()
-	if err := meta.WriteTo(frame); err != nil {
-		return err
-	}
-
-	// Write payload length and content
-	// Mux.Pro: This handles both Extra Data and actual data payload.
-	Must2(serial.WriteUint16(frame, uint16(payload.Len())))
-	Must2(frame.Write(payload.Bytes())) // Write all bytes from the MultiBuffer
-
-	return writer.WriteMultiBuffer(buf.MultiBuffer{frame})
-}
-
 // writeDataInternal is an internal function that actually writes data frames, without flow control logic.
 // It constructs the full Extra Data payload including any UDP specific prefixes.
 // packetDest: For UDP packets, this is the associated net.Destination (e.g., source for responses, target for requests).
@@ -169,24 +127,11 @@ func (w *Writer) writeDataInternal(dataMB buf.MultiBuffer, packetDest *net.Desti
 			addrPrefix := buf.New()
 			// UDP Extra Data format: 1 byte network type (0x02 for UDP), then address/port
 			common.Must(addrPrefix.WriteByte(byte(TargetNetworkUDP)))
-			// Assuming addrParser.WriteAddressPort is available
-			// This part needs a concrete `addrParser` definition or direct implementation.
-			// For now, let's manually write address and port.
-			if packetDest.Address.Family().IsIPv4() {
-				common.Must(addrPrefix.WriteByte(protocol.AddressTypeIPv4))
-				common.Must(addrPrefix.Write(packetDest.Address.IP()))
-			} else if packetDest.Address.Family().IsIPv6() {
-				common.Must(addrPrefix.WriteByte(protocol.AddressTypeIPv6))
-				common.Must(addrPrefix.Write(packetDest.Address.IP()))
-			} else if packetDest.Address.Family().IsDomain() {
-				common.Must(addrPrefix.WriteByte(protocol.AddressTypeDomain))
-				common.Must(addrPrefix.WriteByte(byte(len(packetDest.Address.Domain()))))
-				common.Must(addrPrefix.WriteString(packetDest.Address.Domain()))
-			} else {
+			// Use addrParser.WriteAddressPort from frame.go
+			if err := addrParser.WriteAddressPort(addrPrefix, packetDest.Address, packetDest.Port); err != nil {
 				addrPrefix.Release()
-				return newError("unsupported UDP address family: ", packetDest.Address.Family()).AtWarning()
+				return newError("failed to write UDP address/port to Extra Data").Base(err).AtWarning()
 			}
-			common.Must(WriteUint16(addrPrefix, uint16(packetDest.Port)))
 
 			// If GlobalID is present (e.g., server sending response with client's GlobalID), append it here
 			// For server-to-client responses, use w.responseGlobalID.
@@ -250,9 +195,9 @@ func (w *Writer) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			mb = nil // All data processed for this iteration
 
 			if w.followup { // This is a Keep frame
-				if w.responseUDPSource != nil { // Server sending response
+				if w.responseUDPSource != nil { // Server sending response with specific source
 					packetDest = w.responseUDPSource
-				} else { // Client sending request (initial New frame already handled globalID)
+				} else { // Client sending subsequent UDP data (target already in New frame)
 					packetDest = &w.dest // Use the session's target destination
 				}
 			} else { // This is a New frame (client-side)
