@@ -134,20 +134,20 @@ func (w *Writer) writeDataInternal(mb buf.MultiBuffer) error {
 	// Mux.Pro: Handle XUDP extension for Keep frames (for UDP packet transfer type)
 	// This applies to both client sending UDP data and server sending UDP responses.
 	if meta.SessionStatus == SessionStatusKeep && w.transferType == protocol.TransferTypePacket {
-		// Check if the current buffer has UDP metadata (original UDP packet from application or response)
-		if !mb.IsEmpty() && mb[0].UDP != nil {
+		// Check if the current MultiBuffer has UDP metadata (original UDP packet from application or response)
+		if !mb.IsEmpty() && mb.UDP != nil { // Corrected: mb[0].UDP to mb.UDP
 			meta.Option.Set(OptionUDPData) // Set the new OptionUDPData bit in metadata
 
 			addrPrefix := buf.New()
 			// XUDP format for Extra Data prefix: 1 byte network type (0x02 for UDP), then address/port
 			common.Must(addrPrefix.WriteByte(byte(TargetNetworkUDP)))
-			if err := addrParser.WriteAddressPort(addrPrefix, mb[0].UDP.Address, mb[0].UDP.Port); err != nil {
+			if err := addrParser.WriteAddressPort(addrPrefix, mb.UDP.Address, mb.UDP.Port); err != nil { // Corrected: mb[0].UDP to mb.UDP
 				addrPrefix.Release()
 				return newError("failed to write UDP address/port prefix").Base(err)
 			}
 			// If GlobalID is present (e.g., server sending response with client's GlobalID), append it here
 			if w.globalID != (GlobalID{}) {
-				common.Must(addrPrefix.Write(w.globalID[:]))
+				common.Must2(addrPrefix.Write(w.globalID[:])) // Corrected: common.Must to common.Must2
 			}
 			fullPayload = append(fullPayload, addrPrefix)
 		}
@@ -179,11 +179,10 @@ func (w *Writer) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			}
 		} else {
 			// Packet mode takes the first packet
-			var firstBuffer *buf.Buffer
-			currentChunk, firstBuffer = buf.SplitFirst(mb)
-			if firstBuffer != nil { // Ensure firstBuffer is not nil before appending
-				currentChunk = append(currentChunk, firstBuffer)
-			}
+			// In packet mode, the entire MultiBuffer 'mb' is treated as one chunk.
+			// The UDP metadata is expected to be on the MultiBuffer itself (mb.UDP).
+			currentChunk = mb
+			mb = nil // All data processed for this iteration
 		}
 
 		chunkLen := uint32(currentChunk.Len())
