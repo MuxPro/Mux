@@ -11,37 +11,44 @@ import (
 
 // Writer 负责将应用层数据打包成 Mux 帧。
 type Writer struct {
-	dest         net.Destination
-	writer       buf.Writer
-	id           uint16
-	followup     bool
-	hasError     bool // Mux.Pro: 此字段将被 ErrorCode 取代，但暂时保留以兼容旧逻辑
-	transferType protocol.TransferType
-	priority     byte // Mux.Pro: 用于 New 帧的优先级
+	dest             net.Destination
+	writer           buf.Writer
+	id               uint16
+	followup         bool
+	transferType     protocol.TransferType
+	priority         byte   // Mux.Pro: 用于 New 帧的优先级
+	currentErrorCode uint16 // Mux.Pro: 用于 End 帧的错误码，默认为 GracefulShutdown
 }
 
 // NewWriter 创建一个新的 Writer，用于发送客户端发起的 Mux 帧。
 // priority: Mux.Pro 新增字段，用于设置新连接的优先级。
 func NewWriter(id uint16, dest net.Destination, writer buf.Writer, transferType protocol.TransferType, priority byte) *Writer {
 	return &Writer{
-		id:           id,
-		dest:         dest,
-		writer:       writer,
-		followup:     false,
-		transferType: transferType,
-		priority:     priority, // Mux.Pro: 初始化优先级
+		id:               id,
+		dest:             dest,
+		writer:           writer,
+		followup:         false,
+		transferType:     transferType,
+		priority:         priority,
+		currentErrorCode: ErrorCodeGracefulShutdown, // Mux.Pro: 默认正常关闭
 	}
 }
 
 // NewResponseWriter 创建一个新的 Writer，用于发送服务器响应的 Mux 帧。
 func NewResponseWriter(id uint16, writer buf.Writer, transferType protocol.TransferType) *Writer {
 	return &Writer{
-		id:           id,
-		writer:       writer,
-		followup:     true,
-		transferType: transferType,
-		priority:     0x00, // Mux.Pro: 响应Writer默认优先级为0
+		id:               id,
+		writer:           writer,
+		followup:         true,
+		transferType:     transferType,
+		priority:         0x00,                        // Mux.Pro: 响应Writer默认优先级为0
+		currentErrorCode: ErrorCodeGracefulShutdown, // Mux.Pro: 默认正常关闭
 	}
+}
+
+// SetErrorCode 设置 Writer 在关闭时使用的错误码。
+func (w *Writer) SetErrorCode(code uint16) {
+	w.currentErrorCode = code
 }
 
 // getNextFrameMeta 生成下一个 Mux 帧的元数据。
@@ -128,18 +135,16 @@ func (w *Writer) WriteMultiBuffer(mb buf.MultiBuffer) error {
 }
 
 // Close 实现 common.Closable 接口，关闭 Writer 并发送 End 帧。
-// errorCode: Mux.Pro 新增参数，指定关闭子连接的原因。
-func (w *Writer) Close(errorCode uint16) error {
+func (w *Writer) Close() error {
 	meta := FrameMetadata{
 		SessionID:     w.id,
 		SessionStatus: SessionStatusEnd,
 	}
 
 	// Mux.Pro: 如果错误码不是正常关闭，则设置 OptionData 位并包含错误码。
-	// OptionError 在 Mux.Pro 中被 ErrorCode 机制取代。
-	if errorCode != ErrorCodeGracefulShutdown {
+	if w.currentErrorCode != ErrorCodeGracefulShutdown {
 		meta.Option.Set(OptionData) // D(0x01) 位在 End 帧中表示 ErrorCode 存在
-		meta.ErrorCode = errorCode
+		meta.ErrorCode = w.currentErrorCode
 	}
 
 	frame := buf.New()
