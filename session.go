@@ -18,10 +18,6 @@ const (
 	CreditUpdateThreshold uint32 = 32 * 1024 // 32KB
 )
 
-// GlobalID is an 8-byte identifier for UDP FullCone NAT sessions.
-// It's defined here as it's used in Session struct.
-type GlobalID [8]byte
-
 // SessionManager manages all sub-connections within a Mux main connection.
 type SessionManager struct {
 	sync.RWMutex
