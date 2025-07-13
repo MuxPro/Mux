@@ -1,7 +1,7 @@
 package mux
 
 import (
-	"time" // 引入 time 包用于超时
+	"time"
 	"github.com/v2fly/v2ray-core/v5/common"
 	"github.com/v2fly/v2ray-core/v5/common/buf"
 	"github.com/v2fly/v2ray-core/v5/common/errors"
@@ -10,7 +10,7 @@ import (
 	"github.com/v2fly/v2ray-core/v5/common/serial"
 )
 
-// Writer 负责将应用层数据打包成 Mux 帧。
+// Writer is responsible for packaging application layer data into Mux frames.
 type Writer struct {
 	dest             net.Destination
 	writer           buf.Writer
@@ -19,13 +19,15 @@ type Writer struct {
 	transferType     protocol.TransferType
 	priority         byte
 	currentErrorCode uint16
-	session          *Session // Mux.Pro: 引用关联的 Session，用于流控
+	session          *Session // Mux.Pro: Reference to the associated Session for flow control
+	globalID         GlobalID // Mux.Pro: GlobalID for UDP FullCone NAT
 }
 
-// NewWriter 创建一个新的 Writer，用于发送客户端发起的 Mux 帧。
-// priority: Mux.Pro 新增字段，用于设置新连接的优先级。
-// s: Mux.Pro 新增参数，指向此 Writer 关联的 Session，用于流控。
-func NewWriter(id uint16, dest net.Destination, writer buf.Writer, transferType protocol.TransferType, priority byte, s *Session) *Writer {
+// NewWriter creates a new Writer for sending client-initiated Mux frames.
+// priority: Mux.Pro new field, used to set the priority of a new connection.
+// s: Mux.Pro new parameter, points to the Session associated with this Writer for flow control.
+// globalID: Mux.Pro new parameter, GlobalID for UDP FullCone NAT.
+func NewWriter(id uint16, dest net.Destination, writer buf.Writer, transferType protocol.TransferType, priority byte, s *Session, globalID GlobalID) *Writer {
 	return &Writer{
 		id:               id,
 		dest:             dest,
@@ -33,35 +35,38 @@ func NewWriter(id uint16, dest net.Destination, writer buf.Writer, transferType 
 		followup:         false,
 		transferType:     transferType,
 		priority:         priority,
-		currentErrorCode: ErrorCodeGracefulShutdown, // Mux.Pro: 默认正常关闭
-		session:          s,                         // Mux.Pro: 关联 Session
+		currentErrorCode: ErrorCodeGracefulShutdown, // Mux.Pro: Default to graceful shutdown
+		session:          s,                         // Mux.Pro: Associated Session
+		globalID:         globalID,                  // Mux.Pro: GlobalID
 	}
 }
 
-// NewResponseWriter 创建一个新的 Writer，用于发送服务器响应的 Mux 帧。
-// s: Mux.Pro 新增参数，指向此 Writer 关联的 Session，用于流控。
+// NewResponseWriter creates a new Writer for sending server response Mux frames.
+// s: Mux.Pro new parameter, points to the Session associated with this Writer for flow control.
 func NewResponseWriter(id uint16, writer buf.Writer, transferType protocol.TransferType, s *Session) *Writer {
 	return &Writer{
 		id:               id,
 		writer:           writer,
 		followup:         true,
 		transferType:     transferType,
-		priority:         0x00,                        // Mux.Pro: 响应Writer默认优先级为0
-		currentErrorCode: ErrorCodeGracefulShutdown, // Mux.Pro: 默认正常关闭
-		session:          s,                         // Mux.Pro: 关联 Session
+		priority:         0x00,                        // Mux.Pro: Response Writer default priority is 0
+		currentErrorCode: ErrorCodeGracefulShutdown, // Mux.Pro: Default to graceful shutdown
+		session:          s,                         // Mux.Pro: Associated Session
+		globalID:         GlobalID{},                // Mux.Pro: Response writer doesn't generate GlobalID
 	}
 }
 
-// SetErrorCode 设置 Writer 在关闭时使用的错误码。
+// SetErrorCode sets the error code to be used by the Writer upon closing.
 func (w *Writer) SetErrorCode(code uint16) {
 	w.currentErrorCode = code
 }
 
-// getNextFrameMeta 生成下一个 Mux 帧的元数据。
+// getNextFrameMeta generates the metadata for the next Mux frame.
 func (w *Writer) getNextFrameMeta() FrameMetadata {
 	meta := FrameMetadata{
 		SessionID: w.id,
 		Target:    w.dest,
+		GlobalID:  w.globalID, // Mux.Pro: Include GlobalID in metadata
 	}
 
 	if w.followup {
@@ -69,14 +74,14 @@ func (w *Writer) getNextFrameMeta() FrameMetadata {
 	} else {
 		w.followup = true
 		meta.SessionStatus = SessionStatusNew
-		// Mux.Pro: 对于 SessionStatusNew 帧，设置优先级
+		// Mux.Pro: For SessionStatusNew frames, set priority
 		meta.Priority = w.priority
 	}
 
 	return meta
 }
 
-// writeMetaOnly 仅发送元数据帧（不带额外数据）。
+// writeMetaOnly sends a metadata-only frame (without extra data).
 func (w *Writer) writeMetaOnly() error {
 	meta := w.getNextFrameMeta()
 	b := buf.New()
@@ -86,18 +91,18 @@ func (w *Writer) writeMetaOnly() error {
 	return w.writer.WriteMultiBuffer(buf.MultiBuffer{b})
 }
 
-// writeMetaWithFrame 写入元数据和额外数据。
+// writeMetaWithFrame writes metadata and extra data.
 func writeMetaWithFrame(writer buf.Writer, meta FrameMetadata, data buf.MultiBuffer) error {
 	frame := buf.New()
 	if err := meta.WriteTo(frame); err != nil {
 		return err
 	}
-	// Mux.Pro: Extra Data 自身也带有长度字段
+	// Mux.Pro: Extra Data itself has a length field
 	if _, err := serial.WriteUint16(frame, uint16(data.Len())); err != nil {
 		return err
 	}
 
-	if len(data)+1 > 64*1024*1024 { // 检查总长度是否过大
+	if len(data)+1 > 64*1024*1024 { // Check if total length is too large
 		return errors.New("value too large")
 	}
 	sliceSize := len(data) + 1
@@ -107,15 +112,15 @@ func writeMetaWithFrame(writer buf.Writer, meta FrameMetadata, data buf.MultiBuf
 	return writer.WriteMultiBuffer(mb2)
 }
 
-// writeDataInternal 是实际写入数据帧的内部函数，不包含流控逻辑。
+// writeDataInternal is an internal function that actually writes data frames, without flow control logic.
 func (w *Writer) writeDataInternal(mb buf.MultiBuffer) error {
 	meta := w.getNextFrameMeta()
-	meta.Option.Set(OptionData) // 设置 OptionData 位，表示有额外数据
+	meta.Option.Set(OptionData) // Set OptionData bit, indicating extra data presence
 	return writeMetaWithFrame(w.writer, meta, mb)
 }
 
-// WriteMultiBuffer 实现 buf.Writer 接口，将 MultiBuffer 写入 Mux 帧。
-// 包含了 Mux.Pro 的信用流控逻辑。
+// WriteMultiBuffer implements buf.Writer interface, writing MultiBuffer to Mux frames.
+// Includes Mux.Pro's credit-based flow control logic.
 func (w *Writer) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	defer buf.ReleaseMulti(mb)
 
@@ -124,19 +129,17 @@ func (w *Writer) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	}
 
 	for !mb.IsEmpty() {
-		var currentChunk buf.MultiBuffer // 用于处理当前正在发送的块
+		var currentChunk buf.MultiBuffer // Used to process the current chunk being sent
 		if w.transferType == protocol.TransferTypeStream {
-			// 流模式按 8KB 分割，或者剩余所有数据
+			// Stream mode splits by 8KB, or all remaining data
 			if mb.Len() > 8*1024 {
-				// 修正: buf.SplitSize 返回两个 buf.MultiBuffer
 				currentChunk, mb = buf.SplitSize(mb, 8*1024)
 			} else {
 				currentChunk = mb
-				mb = nil // 所有数据都已处理
+				mb = nil // All data processed
 			}
 		} else {
-			// 包模式取第一个包
-			// 修正: buf.SplitFirst 返回 buf.MultiBuffer 和 buf.Buffer
+			// Packet mode takes the first packet
 			var firstBuffer *buf.Buffer
 			currentChunk, firstBuffer = buf.SplitFirst(mb)
 			if firstBuffer != nil { // Ensure firstBuffer is not nil before appending
@@ -145,33 +148,32 @@ func (w *Writer) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		}
 
 		chunkLen := uint32(currentChunk.Len())
-		if chunkLen == 0 { // 空块，直接跳过
+		if chunkLen == 0 { // Empty chunk, skip directly
 			continue
 		}
 
-		for chunkLen > 0 { // 循环直到当前块完全发送
-			// Mux.Pro: 在尝试消费信用或等待之前，检查 SessionManager 是否正在关闭
+		for chunkLen > 0 { // Loop until the current chunk is fully sent
+			// Mux.Pro: Before attempting to consume credit or wait, check if SessionManager is closing
 			if w.session.parent.Closed() {
 				return newError("session manager closed while waiting for credit for session ", w.id).AtWarning()
 			}
 
 			consumed, ok := w.session.ConsumeCredit(chunkLen)
 			if ok {
-				// 成功消费了信用，发送相应部分的数据
-				// 修正: buf.SplitSize 返回两个 buf.MultiBuffer
+				// Successfully consumed credit, send the corresponding part of the data
 				partToSend, remainingInChunk := buf.SplitSize(currentChunk, int32(consumed))
 				if err := w.writeDataInternal(partToSend); err != nil {
 					return err
 				}
-				currentChunk = remainingInChunk // 更新 currentChunk 为剩余未发送的部分
+				currentChunk = remainingInChunk // Update currentChunk to the remaining unsent part
 				chunkLen -= consumed
 			} else {
-				// 没有信用可消费，等待信用更新信号或超时
+				// No credit available, wait for credit update signal or timeout
 				select {
 				case <-w.session.creditUpdate:
-					// 收到信用更新信号，继续尝试消费信用
+					// Received credit update signal, continue trying to consume credit
 					continue
-				case <-time.After(time.Second * 30): // 设置超时，防止无限期阻塞
+				case <-time.After(time.Second * 30): // Set timeout to prevent indefinite blocking
 					return newError("writer for session ", w.id, " blocked due to no credit, timed out").AtWarning()
 				}
 			}
@@ -181,23 +183,23 @@ func (w *Writer) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	return nil
 }
 
-// Close 实现 common.Closable 接口，关闭 Writer 并发送 End 帧。
+// Close implements common.Closable interface, closes the Writer and sends an End frame.
 func (w *Writer) Close() error {
 	meta := FrameMetadata{
 		SessionID:     w.id,
 		SessionStatus: SessionStatusEnd,
 	}
 
-	// Mux.Pro: 如果错误码不是正常关闭，则设置 OptionData 位并包含错误码。
+	// Mux.Pro: If the error code is not graceful shutdown, set OptionData bit and include error code.
 	if w.currentErrorCode != ErrorCodeGracefulShutdown {
-		meta.Option.Set(OptionData) // D(0x01) 位在 End 帧中表示 ErrorCode 存在
+		meta.Option.Set(OptionData) // D(0x01) bit in End frame indicates ErrorCode presence
 		meta.ErrorCode = w.currentErrorCode
 	}
 
 	frame := buf.New()
 	common.Must(meta.WriteTo(frame))
 
-	// 尝试写入 End 帧，不处理错误，因为此时连接可能已经断开。
+	// Attempt to write End frame, do not handle error as connection might be broken.
 	w.writer.WriteMultiBuffer(buf.MultiBuffer{frame})
 	return nil
 }

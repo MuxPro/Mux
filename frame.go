@@ -12,53 +12,57 @@ import (
 	"github.com/v2fly/v2ray-core/v5/common/serial"
 )
 
-// Mux.Pro protocol version 0.0.
+// Version represents the current Mux.Pro protocol version.
 // Major (2 bytes) | Minor (2 bytes)
 const (
-	Version uint32 = 0x00000000
+	Version uint32 = 0x00000001 // Mux.Pro protocol version 0.1
 )
 
-// SessionStatus 定义了帧的类型和用途。
+// SessionStatus defines the type and purpose of a frame.
 type SessionStatus byte
 
 const (
-	SessionStatusNegotiateVersion SessionStatus = 0x00 // Mux.Pro: 版本协商
-	SessionStatusNew              SessionStatus = 0x01 // 新建子连接
-	SessionStatusKeep             SessionStatus = 0x02 // 传输数据
-	SessionStatusEnd              SessionStatus = 0x03 // 关闭子连接
-	SessionStatusKeepAlive        SessionStatus = 0x04 // 保持主连接
-	SessionStatusCreditUpdate     SessionStatus = 0x05 // Mux.Pro: 信用更新 (流控)
+	SessionStatusNegotiateVersion SessionStatus = 0x00 // Mux.Pro: Version negotiation
+	SessionStatusNew              SessionStatus = 0x01 // New sub-connection
+	SessionStatusKeep             SessionStatus = 0x02 // Data transfer
+	SessionStatusEnd              SessionStatus = 0x03 // Close sub-connection
+	SessionStatusKeepAlive        SessionStatus = 0x04 // Keep main connection alive
+	SessionStatusCreditUpdate     SessionStatus = 0x05 // Mux.Pro: Credit update (flow control)
 )
 
-// Option 定义了元数据中的选项位。
+// Option defines option bits within the metadata.
 const (
-	// D (0x01): Data Present.
-	// 对于数据帧 (New, Keep)，表示有 Extra Data。
-	// 对于 End 帧，表示有 ErrorCode。
-	// 对于 NegotiateVersion 和 CreditUpdate 帧，表示有 Extra Data。
+	// OptionData (0x01): Data Present.
+	// For data frames (New, Keep), indicates Extra Data presence.
+	// For End frames, indicates ErrorCode presence.
+	// For NegotiateVersion and CreditUpdate frames, indicates Extra Data presence.
 	OptionData bitmask.Byte = 0x01
 
-	// Mux.Cool 中用于表示错误的位，在 Mux.Pro 中被 End 帧的 ErrorCode 机制取代。
-	OptionError bitmask.Byte = 0x02
+	// OptionError (0x02): Used in Mux.Cool to indicate error, replaced by ErrorCode in Mux.Pro.
+	OptionError bitmask.Byte = 0x02 // Deprecated in Mux.Pro
 )
 
-// ErrorCode... 定义了 Mux.Pro End 帧中的错误码。
+// ErrorCode defines error codes in Mux.Pro End frames.
 const (
-	ErrorCodeGracefulShutdown   uint16 = 0x0000 // 正常关闭
-	ErrorCodeRemoteDisconnect   uint16 = 0x0001 // 远端目标断开连接
-	ErrorCodeOperationTimeout   uint16 = 0x0002 // 操作超时
-	ErrorCodeProtocolError      uint16 = 0x0003 // 协议错误
-	ErrorCodeResourceExhaustion uint16 = 0x0004 // 资源耗尽
-	ErrorCodeDestUnreachable    uint16 = 0x0005 // 目标不可达
-	ErrorCodeProxyRejected      uint16 = 0x0006 // 代理拒绝
+	ErrorCodeGracefulShutdown   uint16 = 0x0000 // Normal closure
+	ErrorCodeRemoteDisconnect   uint16 = 0x0001 // Remote target disconnected
+	ErrorCodeOperationTimeout   uint16 = 0x0002 // Operation timed out
+	ErrorCodeProtocolError      uint16 = 0x0003 // Protocol violation
+	ErrorCodeResourceExhaustion uint16 = 0x0004 // Resource exhaustion
+	ErrorCodeDestUnreachable    uint16 = 0x0005 // Destination unreachable
+	ErrorCodeProxyRejected      uint16 = 0x0006 // Proxy rejected request
 )
 
+// TargetNetwork specifies the network protocol for the target.
 type TargetNetwork byte
 
 const (
 	TargetNetworkTCP TargetNetwork = 0x01
 	TargetNetworkUDP TargetNetwork = 0x02
 )
+
+// GlobalID is an 8-byte identifier for a UDP session, used for FullCone NAT.
+type GlobalID [8]byte
 
 var addrParser = protocol.NewAddressParser(
 	protocol.AddressFamilyByte(byte(protocol.AddressTypeIPv4), net.AddressFamilyIPv4),
@@ -68,34 +72,35 @@ var addrParser = protocol.NewAddressParser(
 )
 
 /*
-Mux.Pro Frame 格式
+Mux.Pro Frame Format
 +-------------------+-----------------+----------------+
-| 2 字节            | L 字节          | X 字节         |
+| 2 bytes           | L bytes         | X bytes        |
 +-------------------+-----------------+----------------+
-| 元数据长度 L      | 元数据          | 额外数据       |
+| Metadata Length L | Metadata        | Extra Data     |
 +-------------------+-----------------+----------------+
 
-元数据 (Metadata) 格式
-+-----------+---------------+-------------------+---------------------+
-| 2 字节    | 1 字节        | 1 字节            | 可变长度            |
-+-----------+---------------+-------------------+---------------------+
-| ID        | 状态 S        | 选项 Opt          | 选项/字段...        |
-+-----------+---------------+-------------------+---------------------+
+Metadata Format
++-----------+---------------+-------------------+---------------------+----------------+
+| 2 bytes   | 1 byte        | 1 byte            | Variable Length     | 8 bytes (XUDP) |
++-----------+---------------+-------------------+---------------------+----------------+
+| ID        | State S       | Option Opt        | Options/Fields...   | GlobalID (UDP) |
++-----------+---------------+-------------------+---------------------+----------------+
 */
 
-// FrameMetadata 代表一个 Mux 帧的元数据部分。
+// FrameMetadata represents the metadata part of a Mux frame.
 type FrameMetadata struct {
 	Target        net.Destination
 	SessionID     uint16
 	Option        bitmask.Byte
 	SessionStatus SessionStatus
 
-	// Mux.Pro 新增字段
-	Priority  byte   // 用于 New 帧
-	ErrorCode uint16 // 用于 End 帧
+	// Mux.Pro specific fields
+	Priority  byte   // Used in New frames
+	ErrorCode uint16 // Used in End frames
+	GlobalID  GlobalID // Mux.Pro: Used in New frames for UDP FullCone NAT
 }
 
-// WriteTo 将元数据序列化到缓冲区中。
+// WriteTo serializes the metadata into the buffer.
 func (f *FrameMetadata) WriteTo(b *buf.Buffer) error {
 	lenBytes := b.Extend(2)
 	len0 := b.Len()
@@ -114,14 +119,18 @@ func (f *FrameMetadata) WriteTo(b *buf.Buffer) error {
 		case net.Network_UDP:
 			common.Must(b.WriteByte(byte(TargetNetworkUDP)))
 		}
-		// Mux.Pro: 写入优先级字段
+		// Mux.Pro: Write priority field
 		common.Must(b.WriteByte(f.Priority))
 
 		if err := addrParser.WriteAddressPort(b, f.Target.Address, f.Target.Port); err != nil {
 			return err
 		}
+		// Mux.Pro: If UDP, write GlobalID
+		if f.Target.Network == net.Network_UDP && f.GlobalID != [8]byte{} {
+			Must2(b.Write(f.GlobalID[:]))
+		}
 	case SessionStatusEnd:
-		// Mux.Pro: 对于 End 帧, Opt(D) 表示 ErrorCode 存在。
+		// Mux.Pro: For End frames, OptionData (D) indicates ErrorCode presence.
 		if f.Option.Has(OptionData) {
 			if err := WriteUint16(b, f.ErrorCode); err != nil {
 				return err
@@ -134,13 +143,13 @@ func (f *FrameMetadata) WriteTo(b *buf.Buffer) error {
 	return nil
 }
 
-// Unmarshal 从 reader 中读取并解析元数据。
+// Unmarshal reads and parses metadata from the reader.
 func (f *FrameMetadata) Unmarshal(reader io.Reader) error {
 	metaLen, err := serial.ReadUint16(reader)
 	if err != nil {
 		return err
 	}
-	if metaLen > 512 {
+	if metaLen > 512 { // Limit metadata length to prevent abuse
 		return newError("invalid metalen ", metaLen).AtError()
 	}
 
@@ -153,7 +162,7 @@ func (f *FrameMetadata) Unmarshal(reader io.Reader) error {
 	return f.UnmarshalFromBuffer(b)
 }
 
-// UnmarshalFromBuffer 从给定的缓冲区中解析元数据。
+// UnmarshalFromBuffer parses metadata from the given buffer.
 func (f *FrameMetadata) UnmarshalFromBuffer(b *buf.Buffer) error {
 	if b.Len() < 4 {
 		return newError("insufficient buffer for metadata header: ", b.Len())
@@ -162,20 +171,21 @@ func (f *FrameMetadata) UnmarshalFromBuffer(b *buf.Buffer) error {
 	f.SessionID = binary.BigEndian.Uint16(b.Bytes())
 	f.SessionStatus = SessionStatus(b.Byte(2))
 	f.Option = bitmask.Byte(b.Byte(3))
-	b.Advance(4) // 消耗已读取的头部
+	b.Advance(4) // Consume the read header
 
-	// 设置默认值
+	// Set default values
 	f.Target.Network = net.Network_Unknown
 	f.ErrorCode = ErrorCodeGracefulShutdown
+	f.GlobalID = [8]byte{} // Initialize GlobalID to zero
 
 	switch f.SessionStatus {
 	case SessionStatusNew:
-		// 至少需要1字节网络类型和1字节优先级
+		// At least 1 byte for network type and 1 byte for priority
 		if b.Len() < 2 {
 			return newError("insufficient buffer for New frame fields: ", b.Len())
 		}
 		network := TargetNetwork(b.Byte(0))
-		// Mux.Pro: 读取优先级字段
+		// Mux.Pro: Read priority field
 		f.Priority = b.Byte(1)
 		b.Advance(2)
 
@@ -192,8 +202,13 @@ func (f *FrameMetadata) UnmarshalFromBuffer(b *buf.Buffer) error {
 		default:
 			return newError("unknown network type: ", network)
 		}
+		// Mux.Pro: If UDP, read GlobalID
+		if f.Target.Network == net.Network_UDP && b.Len() >= 8 {
+			copy(f.GlobalID[:], b.Bytes()[:8])
+			b.Advance(8)
+		}
 	case SessionStatusEnd:
-		// Mux.Pro: 对于 End 帧, Opt(D) 表示 ErrorCode 存在。
+		// Mux.Pro: For End frames, OptionData (D) indicates ErrorCode presence.
 		if f.Option.Has(OptionData) {
 			if b.Len() < 2 {
 				return newError("insufficient buffer for End frame error code: ", b.Len())
