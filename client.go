@@ -9,6 +9,7 @@ import (
 	"github.com/v2fly/v2ray-core/v5/common"
 	"github.com/v2fly/v2ray-core/v5/common/buf"
 	"github.com/v2fly/v2ray-core/v5/common/errors"
+	"github.com/v2fly/v2ray-core/v5/common/log"
 	"github.com/v2fly/v2ray-core/v5/common/net"
 	"github.com/v2fly/v2ray-core/v5/common/protocol"
 	"github.com/v2fly/v2ray-core/v5/common/session"
@@ -21,394 +22,515 @@ import (
 )
 
 type ClientManager struct {
-	Enabled bool // wheather mux is enabled from user config
+	Enabled bool // whether mux is enabled from user config
 	Picker  WorkerPicker
 }
 
 func (m *ClientManager) Dispatch(ctx context.Context, link *transport.Link) error {
-	for i := 0; i < 16; i++ {
+	for i := 0; i < 16; i++ { // Try to pick an existing worker
 		worker, err := m.Picker.PickAvailable()
 		if err != nil {
-			return err
+			if errors.Is(err, ErrNoWorker) {
+				break
+			}
+			return newError("failed to pick worker").Base(err)
 		}
-		if worker.Dispatch(ctx, link) {
+		if err := worker.Dispatch(ctx, link); err == nil {
 			return nil
 		}
 	}
 
-	return newError("unable to find an available mux client").AtWarning()
+	worker, err := m.Picker.PickOrCreate() // Create a new worker if no available
+	if err != nil {
+		return newError("failed to pick or create worker").Base(err)
+	}
+	return worker.Dispatch(ctx, link)
 }
 
 type WorkerPicker interface {
-	PickAvailable() (*ClientWorker, error)
+	PickAvailable() (ClientWorker, error)
+	PickOrCreate() (ClientWorker, error)
+	Release(ClientWorker)
 }
 
-type IncrementalWorkerPicker struct {
-	Factory ClientWorkerFactory
-
-	access      sync.Mutex
-	workers     []*ClientWorker
-	cleanupTask *task.Periodic
-}
-
-func (p *IncrementalWorkerPicker) cleanupFunc() error {
-	p.access.Lock()
-	defer p.access.Unlock()
-
-	if len(p.workers) == 0 {
-		return newError("no worker")
-	}
-
-	p.cleanup()
-	return nil
-}
-
-func (p *IncrementalWorkerPicker) cleanup() {
-	var activeWorkers []*ClientWorker
-	for _, w := range p.workers {
-		if !w.Closed() {
-			activeWorkers = append(activeWorkers, w)
-		}
-	}
-	p.workers = activeWorkers
-}
-
-func (p *IncrementalWorkerPicker) findAvailable() int {
-	for idx, w := range p.workers {
-		if !w.IsFull() {
-			return idx
-		}
-	}
-
-	return -1
-}
-
-func (p *IncrementalWorkerPicker) pickInternal() (*ClientWorker, bool, error) {
-	p.access.Lock()
-	defer p.access.Unlock()
-
-	idx := p.findAvailable()
-	if idx >= 0 {
-		n := len(p.workers)
-		if n > 1 && idx != n-1 {
-			p.workers[n-1], p.workers[idx] = p.workers[idx], p.workers[n-1]
-		}
-		return p.workers[idx], false, nil
-	}
-
-	p.cleanup()
-
-	worker, err := p.Factory.Create()
-	if err != nil {
-		return nil, false, err
-	}
-	p.workers = append(p.workers, worker)
-
-	if p.cleanupTask == nil {
-		p.cleanupTask = &task.Periodic{
-			Interval: time.Second * 30,
-			Execute:  p.cleanupFunc,
-		}
-	}
-
-	return worker, true, nil
-}
-
-func (p *IncrementalWorkerPicker) PickAvailable() (*ClientWorker, error) {
-	worker, start, err := p.pickInternal()
-	if start {
-		common.Must(p.cleanupTask.Start())
-	}
-
-	return worker, err
+type ClientWorker interface {
+	Dispatch(context.Context, *transport.Link) error
+	IsFull() bool
+	IsClosing() bool
 }
 
 type ClientWorkerFactory interface {
-	Create() (*ClientWorker, error)
+	Create() (ClientWorker, error)
+}
+
+type IncrementalWorkerPicker struct {
+	sync.RWMutex
+	workers []ClientWorker
+	factory ClientWorkerFactory
+	strategy ClientStrategy
+}
+
+func NewIncrementalWorkerPicker(f ClientWorkerFactory, s ClientStrategy) *IncrementalWorkerPicker {
+	return &IncrementalWorkerPicker{
+		workers: make([]ClientWorker, 0, 4),
+		factory: f,
+		strategy: s,
+	}
+}
+
+func (p *IncrementalWorkerPicker) PickAvailable() (ClientWorker, error) {
+	p.RLock()
+	defer p.RUnlock()
+
+	if len(p.workers) == 0 {
+		return nil, ErrNoWorker
+	}
+
+	for _, worker := range p.workers {
+		if !worker.IsFull() && !worker.IsClosing() {
+			return worker, nil
+		}
+	}
+	return nil, ErrNoWorker
+}
+
+func (p *IncrementalWorkerPicker) PickOrCreate() (ClientWorker, error) {
+	p.Lock()
+	defer p.Unlock()
+
+	for _, worker := range p.workers {
+		if !worker.IsFull() && !worker.IsClosing() {
+			return worker, nil
+		}
+	}
+
+	if len(p.workers) >= p.strategy.MaxConnection {
+		return nil, newError("max number of connections reached").AtError()
+	}
+
+	worker, err := p.factory.Create()
+	if err != nil {
+		return nil, newError("failed to create worker").Base(err)
+	}
+	p.workers = append(p.workers, worker)
+	return worker, nil
+}
+
+func (p *IncrementalWorkerPicker) Release(w ClientWorker) {
+	p.Lock()
+	defer p.Unlock()
+
+	for idx, worker := range p.workers {
+		if worker == w {
+			p.workers = append(p.workers[:idx], p.workers[idx+1:]...)
+			return
+		}
+	}
 }
 
 type DialingWorkerFactory struct {
-	Proxy    proxy.Outbound
-	Dialer   internet.Dialer
-	Strategy ClientStrategy
-
-	ctx context.Context
+	Proxy proxy.Outbound
 }
 
-func NewDialingWorkerFactory(ctx context.Context, proxy proxy.Outbound, dialer internet.Dialer, strategy ClientStrategy) *DialingWorkerFactory {
-	return &DialingWorkerFactory{
-		Proxy:    proxy,
-		Dialer:   dialer,
-		Strategy: strategy,
-		ctx:      ctx,
+func (f *DialingWorkerFactory) Create() (ClientWorker, error) {
+	// Mux.Pro: Target address and port change
+	dest := net.Destination{
+		Address: muxProAddress,
+		Port:    muxProPort,
+		Network: net.Network_TCP, // Mux.Pro operates over reliable streams, usually TCP
 	}
-}
 
-func (f *DialingWorkerFactory) Create() (*ClientWorker, error) {
-	opts := []pipe.Option{pipe.WithSizeLimit(64 * 1024)}
-	uplinkReader, upLinkWriter := pipe.New(opts...)
-	downlinkReader, downlinkWriter := pipe.New(opts...)
-
-	c, err := NewClientWorker(transport.Link{
-		Reader: downlinkReader,
-		Writer: upLinkWriter,
-	}, f.Strategy)
+	ctx, cancel := context.WithCancel(context.Background())
+	link, err := f.Proxy.Process(ctx, transport.With =session.NewOutbound(dest)), internet.Dial(ctx, dest)
 	if err != nil {
-		return nil, err
+		cancel()
+		return nil, newError("failed to dial to ", dest).Base(err)
 	}
 
-	go func(p proxy.Outbound, d internet.Dialer, c common.Closable) {
-		ctx := session.ContextWithOutbound(f.ctx, &session.Outbound{
-			Target: net.TCPDestination(muxCoolAddress, muxCoolPort),
-		})
-		ctx, cancel := context.WithCancel(ctx)
+	worker := NewClientWorker(link, ClientStrategy{MaxConcurrency: 8, MaxConnection: 1}) // Example strategy
+	go func() {
+		defer cancel()
+		<-worker.(*clientWorker).done.Done() // Wait for worker to close
+	}()
 
-		if err := p.Process(ctx, &transport.Link{Reader: uplinkReader, Writer: downlinkWriter}, d); err != nil {
-			errors.New("failed to handler mux client connection").Base(err).WriteToLog()
-		}
-		common.Must(c.Close())
-		cancel()
-	}(f.Proxy, f.Dialer, c.done)
-
-	return c, nil
+	return worker, nil
 }
 
 type ClientStrategy struct {
-	MaxConcurrency uint32
-	MaxConnection  uint32
+	MaxConcurrency int // Number of concurrent streams on a single Mux connection
+	MaxConnection  int // Number of Mux connections per outbound
 }
 
-type ClientWorker struct {
+type clientWorker struct {
 	sessionManager *SessionManager
-	link           transport.Link
-	done           *done.Instance
+	link           *transport.Link
+	done           *done.Done
 	strategy       ClientStrategy
+	priorityMtx    sync.Mutex // For managing priority allocation
+	nextPriority   byte       // Mux.Pro: Next priority to assign, for round-robin or similar
 }
 
-var (
-	muxCoolAddress = net.DomainAddress("v1.mux.cool")
-	muxCoolPort    = net.Port(9527)
-)
-
-// NewClientWorker creates a new mux.Client.
-func NewClientWorker(stream transport.Link, s ClientStrategy) (*ClientWorker, error) {
-	c := &ClientWorker{
+func NewClientWorker(stream transport.Link, s ClientStrategy) ClientWorker {
+	worker := &clientWorker{
 		sessionManager: NewSessionManager(),
 		link:           stream,
 		done:           done.New(),
 		strategy:       s,
+		nextPriority:   0x00, // Mux.Pro: Start with highest priority
 	}
 
-	go c.fetchOutput()
-	go c.monitor()
+	go worker.monitor()
+	go worker.fetchOutput()
+	go worker.sendKeepAlive() // Mux.Pro: Periodically send KeepAlive
 
-	return c, nil
+	return worker
 }
 
-func (m *ClientWorker) TotalConnections() uint32 {
-	return uint32(m.sessionManager.Count())
+// monitor closes the worker if there are no more active sessions.
+func (m *clientWorker) monitor() {
+	defer m.done.Done()
+	<-time.After(30 * time.Second) // Wait for some initial activity
+
+	for {
+		if m.sessionManager.Closed() {
+			newError("ClientWorker: Session manager closed. Closing worker.").WriteToLog(log.DefaultLogger())
+			return
+		}
+
+		if m.sessionManager.Size() == 0 {
+			if m.sessionManager.CloseIfNoSession() {
+				newError("ClientWorker: No active sessions. Closing worker.").WriteToLog(log.DefaultLogger())
+				return
+			}
+		}
+		time.Sleep(5 * time.Second) // Check every 5 seconds
+	}
 }
 
-func (m *ClientWorker) ActiveConnections() uint32 {
-	return uint32(m.sessionManager.Size())
-}
-
-// Closed returns true if this Client is closed.
-func (m *ClientWorker) Closed() bool {
-	return m.done.Done()
-}
-
-func (m *ClientWorker) monitor() {
-	timer := time.NewTicker(time.Second * 16)
-	defer timer.Stop()
+// sendKeepAlive periodically sends Mux.Pro KeepAlive frames.
+func (m *clientWorker) sendKeepAlive() {
+	ticker := time.NewTicker(30 * time.Second) // Mux.Pro: Send KeepAlive every 30 seconds
+	defer ticker.Stop()
 
 	for {
 		select {
-		case <-m.done.Wait():
-			m.sessionManager.Close()
-			common.Close(m.link.Writer)
-			common.Interrupt(m.link.Reader)
+		case <-m.done.Done():
 			return
-		case <-timer.C:
-			size := m.sessionManager.Size()
-			if size == 0 && m.sessionManager.CloseIfNoSession() {
-				common.Must(m.done.Close())
+		case <-ticker.C:
+			if !m.sessionManager.Closed() {
+				err := WriteKeepAliveFrame(m.link.Writer) // Mux.Pro: Use new WriteKeepAliveFrame
+				if err != nil {
+					newError("Client: Failed to send KeepAlive frame: ", err).WriteToLog(log.DefaultLogger())
+					// On error, consider closing the worker if it's critical.
+				}
 			}
 		}
 	}
 }
 
-func writeFirstPayload(reader buf.Reader, writer *Writer) error {
-	err := buf.CopyOnceTimeout(reader, writer, time.Millisecond*100)
-	if err == buf.ErrNotTimeoutReader || err == buf.ErrReadTimeout {
-		return writer.WriteMultiBuffer(buf.MultiBuffer{})
-	}
-
-	if err != nil {
+func (m *clientWorker) writeFirstPayload(reader buf.Reader, writer *Writer) error {
+	mb, err := reader.ReadMultiBufferTimeout(500 * time.Millisecond) // Read initial data with timeout
+	if err != nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, io.EOF) {
 		return err
 	}
 
-	return nil
+	if mb == nil || mb.IsEmpty() {
+		return writer.writeMetaOnly() // Send New frame without data
+	}
+
+	return writer.WriteMultiBuffer(mb) // Send New frame with data
 }
 
-func fetchInput(ctx context.Context, s *Session, output buf.Writer) {
-	dest := session.OutboundFromContext(ctx).Target
-	transferType := protocol.TransferTypeStream
-	if dest.Network == net.Network_UDP {
-		transferType = protocol.TransferTypePacket
-	}
-	s.transferType = transferType
-	writer := NewWriter(s.ID, dest, output, transferType)
+func (m *clientWorker) fetchInput(ctx context.Context, s *Session, output buf.Writer) {
+	defer common.Close(s.input)
+	defer common.Close(output)
 	defer s.Close()
-	defer writer.Close()
 
-	newError("dispatching request to ", dest).WriteToLog(session.ExportIDToError(ctx))
-	if err := writeFirstPayload(s.input, writer); err != nil {
-		newError("failed to write first payload").Base(err).WriteToLog(session.ExportIDToError(ctx))
-		writer.hasError = true
-		common.Interrupt(s.input)
-		return
-	}
+	// Mux.Pro: Credit-based flow control for sending data to server
+	// We need to wait for credit from the server before sending data.
+	// For simplicity, we assume an initial default credit on session creation,
+	// and then wait for CreditUpdate frames from the server.
+	// A more robust implementation would buffer data if credit is insufficient.
 
-	if err := buf.Copy(s.input, writer); err != nil {
-		newError("failed to fetch all input").Base(err).WriteToLog(session.ExportIDToError(ctx))
-		writer.hasError = true
-		common.Interrupt(s.input)
-		return
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			if s.GetCredit() == 0 {
+				time.Sleep(10 * time.Millisecond) // Wait for credit
+				continue
+			}
+
+			// Read from s.input (application data)
+			mb, err := s.input.ReadMultiBuffer()
+			if err != nil {
+				if !errors.Is(err, io.EOF) {
+					newError("session ", s.ID, " read from input ended with error").Base(err).WriteToLog(log.DefaultLogger())
+					// Mux.Pro: Send End frame with appropriate error code
+					common.Close(output.Close(ErrorCodeRemoteDisconnect))
+				} else {
+					common.Close(output.Close(ErrorCodeGracefulShutdown))
+				}
+				return
+			}
+
+			if mb.IsEmpty() {
+				continue
+			}
+
+			// Mux.Pro: Consume credit for outgoing data
+			dataLen := uint32(mb.Len())
+			if !s.ConsumeCredit(dataLen) {
+				newError("session ", s.ID, " attempting to send data without enough credit. Available: ", s.GetCredit(), ", Needed: ", dataLen).WriteToLog(log.DefaultLogger())
+				buf.ReleaseMulti(mb) // Release data as we can't send it
+				// This indicates a flow control issue.
+				// Could buffer data or close session. For now, close session.
+				common.Close(output.Close(ErrorCodeProtocolError))
+				return
+			}
+
+			if err := output.WriteMultiBuffer(mb); err != nil {
+				if !errors.Is(err, io.EOF) {
+					newError("session ", s.ID, " write to output ended with error").Base(err).WriteToLog(log.DefaultLogger())
+					// Mux.Pro: Send End frame with appropriate error code
+					common.Close(output.Close(ErrorCodeRemoteDisconnect))
+				}
+				return
+			}
+		}
 	}
 }
 
-func (m *ClientWorker) IsClosing() bool {
-	sm := m.sessionManager
-	if m.strategy.MaxConnection > 0 && sm.Count() >= int(m.strategy.MaxConnection) {
-		return true
-	}
-	return false
+func (m *clientWorker) IsClosing() bool {
+	return m.done.Done() != nil // True if the channel is closed
 }
 
-func (m *ClientWorker) IsFull() bool {
-	if m.IsClosing() || m.Closed() {
-		return true
-	}
-
-	sm := m.sessionManager
-	if m.strategy.MaxConcurrency > 0 && sm.Size() >= int(m.strategy.MaxConcurrency) {
-		return true
-	}
-	return false
+func (m *clientWorker) IsFull() bool {
+	return m.sessionManager.Size() >= m.strategy.MaxConcurrency
 }
 
-func (m *ClientWorker) Dispatch(ctx context.Context, link *transport.Link) bool {
-	if m.IsFull() || m.Closed() {
-		return false
-	}
+func (m *clientWorker) Dispatch(ctx context.Context, link *transport.Link) error {
+	m.priorityMtx.Lock()
+	priority := m.nextPriority
+	m.nextPriority = (m.nextPriority + 1) % 0x100 // Cycle through 0x00 to 0xFF
+	m.priorityMtx.Unlock()
 
-	sm := m.sessionManager
-	s := sm.Allocate()
+	s := m.sessionManager.Allocate()
 	if s == nil {
-		return false
+		return newError("failed to allocate session").AtError()
 	}
 	s.input = link.Reader
 	s.output = link.Writer
-	go fetchInput(ctx, s, m.link.Writer)
-	return true
+	s.transferType = protocol.TransferTypeStream // Assuming stream for most V2Ray connections
+
+	// Mux.Pro: Client sends New frame with priority
+	newError("Client: Dispatching new session ", s.ID, " with priority ", priority).WriteToLog(log.DefaultLogger())
+	writer := NewWriter(s.ID, link.Target, m.link.Writer, s.transferType, priority) // Pass priority
+
+	go m.fetchInput(ctx, s, writer)
+
+	return nil
 }
 
-func (m *ClientWorker) handleStatueKeepAlive(meta *FrameMetadata, reader *buf.BufferedReader) error {
+func (m *clientWorker) handleStatueKeepAlive(meta *FrameMetadata, reader *buf.BufferedReader) error {
+	// Mux.Pro: Opt MUST be 0x00. No Extra Data.
+	if meta.Option != 0x00 {
+		return newError("Mux.Pro KeepAlive Opt must be 0x00").AtError()
+	}
+	// As per Mux.Pro, KeepAlive MUST NOT carry any Extra Data.
+	if meta.Option.Has(OptionData) {
+		return newError("Mux.Pro KeepAlive must not have Extra Data").AtError()
+	}
+	return nil
+}
+
+// handleStatusNew is technically not expected on the client side according to Mux.Pro spec,
+// but for robustness, it should discard any such unexpected frames.
+func (m *clientWorker) handleStatusNew(meta *FrameMetadata, reader *buf.BufferedReader) error {
+	newError("Client: Received unexpected New frame for session ", meta.SessionID, ". Discarding.").WriteToLog(log.DefaultLogger())
 	if meta.Option.Has(OptionData) {
 		return buf.Copy(NewStreamReader(reader), buf.Discard)
 	}
 	return nil
 }
 
-func (m *ClientWorker) handleStatusNew(meta *FrameMetadata, reader *buf.BufferedReader) error {
-	if meta.Option.Has(OptionData) {
-		return buf.Copy(NewStreamReader(reader), buf.Discard)
-	}
-	return nil
-}
-
-func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.BufferedReader) error {
+func (m *clientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.BufferedReader) error {
 	if !meta.Option.Has(OptionData) {
-		return nil
+		return nil // No data to process
 	}
 
 	s, found := m.sessionManager.Get(meta.SessionID)
 	if !found {
-		// Notify remote peer to close this session.
+		newError("Client: Received data for unknown session ", meta.SessionID, ". Discarding.").WriteToLog(log.DefaultLogger())
+		// Mux.Pro: Client should also send End frame if it gets data for unknown session
 		closingWriter := NewResponseWriter(meta.SessionID, m.link.Writer, protocol.TransferTypeStream)
-		closingWriter.Close()
-
+		common.Close(closingWriter.Close(ErrorCodeProtocolError))
 		return buf.Copy(NewStreamReader(reader), buf.Discard)
 	}
 
-	rr := s.NewReader(reader)
-	err := buf.Copy(rr, s.output)
-	if err != nil && buf.IsWriteError(err) {
-		newError("failed to write to downstream. closing session ", s.ID).Base(err).WriteToLog()
-
-		// Notify remote peer to close this session.
-		closingWriter := NewResponseWriter(meta.SessionID, m.link.Writer, protocol.TransferTypeStream)
-		closingWriter.Close()
-
-		drainErr := buf.Copy(rr, buf.Discard)
-		common.Interrupt(s.input)
-		s.Close()
-		return drainErr
+	// Mux.Pro: Flow control: Server sending data means we (client) received it.
+	// We should grant credit back to the server after processing.
+	dataLen := reader.Buffer().Len() // Total length of data in the current frame
+	if dataLen > 0 {
+		// Example: Grant credit back every time we receive data.
+		// A more sophisticated approach would buffer or process, then grant.
+		err := WriteCreditUpdateFrame(m.link.Writer, s.ID, uint32(dataLen)) // Grant back what was just received
+		if err != nil {
+			newError("Client: Failed to send credit update for session ", s.ID).Base(err).WriteToLog(log.DefaultLogger())
+			// This is not critical enough to close session immediately, but logs are useful.
+		}
 	}
 
-	return err
+	_, err := buf.Copy(NewStreamReader(reader), s.output)
+	if err != nil {
+		newError("Client: Failed to write data for session ", meta.SessionID).Base(err).WriteToLog(log.DefaultLogger())
+		// Mux.Pro: Client received error from application. Send End frame.
+		common.Close(NewResponseWriter(s.ID, m.link.Writer, s.transferType).Close(ErrorCodeRemoteDisconnect))
+		s.Close() // Close local session too
+		return err
+	}
+	return nil
 }
 
-func (m *ClientWorker) handleStatusEnd(meta *FrameMetadata, reader *buf.BufferedReader) error {
-	if s, found := m.sessionManager.Get(meta.SessionID); found {
-		if meta.Option.Has(OptionError) {
-			common.Interrupt(s.input)
-			common.Interrupt(s.output)
-		}
+func (m *clientWorker) handleStatusEnd(meta *FrameMetadata, reader *buf.BufferedReader) error {
+	s, found := m.sessionManager.Get(meta.SessionID)
+	if found {
+		// Mux.Pro: Read ErrorCode from metadata
+		newError("Client: Session ", meta.SessionID, " closed with error code: ", meta.ErrorCode).WriteToLog(log.DefaultLogger())
+		common.Interrupt(s.input)
+		common.Interrupt(s.output)
 		s.Close()
 	}
+	// Mux.Pro: Discard any extra data if OptionData was set for End frame (protocol violation)
 	if meta.Option.Has(OptionData) {
 		return buf.Copy(NewStreamReader(reader), buf.Discard)
 	}
 	return nil
 }
 
-func (m *ClientWorker) fetchOutput() {
+// handleStatusCreditUpdate handles incoming CreditUpdate frames from the server.
+func (m *clientWorker) handleStatusCreditUpdate(meta *FrameMetadata, reader *buf.BufferedReader) error {
+	_, increment, err := ReadCreditUpdateFrame(reader)
+	if err != nil {
+		return newError("Client: Failed to read CreditUpdate frame").Base(err).AtError()
+	}
+
+	s, found := m.sessionManager.Get(meta.SessionID)
+	if !found {
+		newError("Client: Received credit update for unknown session ", meta.SessionID, ". Discarding.").WriteToLog(log.DefaultLogger())
+		return nil // Just discard for unknown session
+	}
+
+	s.AddCredit(increment)
+	newError("Client: Session ", s.ID, " credit updated by ", increment, ". New credit: ", s.GetCredit()).WriteToLog(log.DefaultLogger())
+	return nil
+}
+
+func (m *clientWorker) fetchOutput() {
 	defer func() {
-		common.Must(m.done.Close())
+		common.Must(m.done.Close()) // Signal worker is done
+		newError("ClientWorker: fetchOutput goroutine finished. Releasing worker.").WriteToLog(log.DefaultLogger())
+		// Release worker from picker if it was managed
+		// This requires picker to be accessible here, or a callback.
+		// For now, it will rely on the monitor to close if no sessions.
 	}()
 
 	reader := &buf.BufferedReader{Reader: m.link.Reader}
 
+	// Mux.Pro: Version Negotiation (REQUIRED)
+	newError("Client: Starting Mux.Pro version negotiation.").WriteToLog(log.DefaultLogger())
+	err := m.negotiateVersion(context.Background(), reader) // Use a context for negotiation
+	if err != nil {
+		newError("Client: Mux.Pro version negotiation failed: ", err).WriteToLog(log.DefaultLogger())
+		return // Close connection on negotiation failure
+	}
+	newError("Client: Mux.Pro version negotiation successful.").WriteToLog(log.DefaultLogger())
+
+	// Main loop for Mux.Pro frame processing
 	var meta FrameMetadata
 	for {
-		err := meta.Unmarshal(reader)
-		if err != nil {
-			if errors.Cause(err) != io.EOF {
-				newError("failed to read metadata").Base(err).WriteToLog()
-			}
+		if m.sessionManager.Closed() {
 			break
 		}
 
-		switch meta.SessionStatus {
-		case SessionStatusKeepAlive:
-			err = m.handleStatueKeepAlive(&meta, reader)
-		case SessionStatusEnd:
-			err = m.handleStatusEnd(&meta, reader)
-		case SessionStatusNew:
-			err = m.handleStatusNew(&meta, reader)
-		case SessionStatusKeep:
-			err = m.handleStatusKeep(&meta, reader)
+		select {
+		case <-m.done.Done():
+			newError("Client worker context done. Closing.").WriteToLog(log.DefaultLogger())
+			return
 		default:
-			status := meta.SessionStatus
-			newError("unknown status: ", status).AtError().WriteToLog()
-			return
-		}
+			err = meta.Unmarshal(reader)
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					newError("Client worker EOF. Closing.").WriteToLog(log.DefaultLogger())
+				} else {
+					newError("Client worker failed to read metadata: ", err).Base(err).WriteToLog(log.DefaultLogger())
+				}
+				return
+			}
 
-		if err != nil {
-			newError("failed to process data").Base(err).WriteToLog()
-			return
+			switch meta.SessionStatus {
+			case SessionStatusKeepAlive:
+				err = m.handleStatueKeepAlive(&meta, reader)
+			case SessionStatusEnd:
+				err = m.handleStatusEnd(&meta, reader)
+			case SessionStatusNew: // Unexpected on client, but handle defensively
+				err = m.handleStatusNew(&meta, reader)
+			case SessionStatusKeep:
+				err = m.handleStatusKeep(&meta, reader)
+			case SessionStatusCreditUpdate: // Mux.Pro: New frame type
+				err = m.handleStatusCreditUpdate(&meta, reader)
+			default:
+				status := meta.SessionStatus
+				err = newError("unknown status: ", status).AtError()
+			}
+
+			if err != nil {
+				newError("Client worker failed to process data: ", err).Base(err).WriteToLog(log.DefaultLogger())
+				// Attempt to send End frame for the problematic session if possible
+				if meta.SessionID != 0x0000 { // If it's a sub-session error
+					common.Close(NewResponseWriter(meta.SessionID, m.link.Writer, protocol.TransferTypeStream).Close(ErrorCodeProtocolError))
+				}
+				return // Critical error, close main connection
+			}
 		}
+	}
+}
+
+// negotiateVersion handles the Mux.Pro version negotiation process for the client.
+func (m *clientWorker) negotiateVersion(ctx context.Context, reader *buf.BufferedReader) error {
+	// Set a timeout for version negotiation
+	negotiationCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	// 1. Client sends its supported versions (MuxProVersion is the only one we support for now)
+	newError("Client: Sending Mux.Pro NegotiateVersion frame with version ", MuxProVersion).WriteToLog(log.DefaultLogger())
+	if err := WriteNegotiateVersionFrame(m.link.Writer, []uint32{MuxProVersion}); err != nil {
+		return newError("failed to send Mux.Pro NegotiateVersion frame").Base(err)
+	}
+
+	// 2. Client reads server's response
+	readDone := make(chan struct{})
+	var serverMeta FrameMetadata
+	var serverVersions []uint32
+	var negotiationErr error
+
+	go func() {
+		defer close(readDone)
+		serverMeta, serverVersions, negotiationErr = ReadNegotiateVersionFrame(reader)
+	}()
+
+	select {
+	case <-negotiationCtx.Done():
+		return newError("Mux.Pro version negotiation timed out or cancelled.").Base(negotiationCtx.Err())
+	case <-readDone:
+		if negotiationErr != nil {
+			return newError("failed to read server NegotiateVersion frame").Base(negotiationErr)
+		}
+		if len(serverVersions) != 1 || serverVersions[0] != MuxProVersion {
+			return newError("server did not negotiate Mux.Pro/0.0, got: ", serverVersions).AtError()
+		}
+		newError("Client: Mux.Pro version negotiated with server: ", serverVersions[0]).WriteToLog(log.DefaultLogger())
+		return nil
 	}
 }
