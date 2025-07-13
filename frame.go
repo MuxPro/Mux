@@ -123,7 +123,7 @@ func (f *FrameMetadata) WriteTo(b *buf.Buffer) error {
 	case SessionStatusEnd:
 		// Mux.Pro: 对于 End 帧, Opt(D) 表示 ErrorCode 存在。
 		if f.Option.Has(OptionData) {
-			if err := serial.WriteUint16(b, f.ErrorCode); err != nil {
+			if err := WriteUint16(b, f.ErrorCode); err != nil {
 				return err
 			}
 		}
