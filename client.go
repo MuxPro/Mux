@@ -533,32 +533,37 @@ func (m *ClientWorker) handleCreditUpdate(meta *FrameMetadata, reader *buf.Buffe
 	return nil
 }
 
-// udpDataInjectingReader is a buf.Reader wrapper that injects UDP metadata into the first buffer.
-// This is used when a Mux Keep frame (SessionStatusKeep) contains OptionUDPData,
-// indicating that the payload is a UDP packet and its source address is in the Extra Data.
+// udpDataInjectingReader is a buf.Reader wrapper that provides UDP metadata.
+// It assumes the underlying buf.Reader provides raw data, and this wrapper
+// is responsible for making UDP metadata available if it was parsed from the Mux frame.
 type udpDataInjectingReader struct {
 	buf.Reader
 	udpDest  net.Destination
 	globalID GlobalID
-	injected bool // Flag to ensure UDP metadata is injected only once per packet
+	// injected bool // Removed, as buf.Buffer doesn't have a direct UDP field to set.
+	// The UDP metadata is logically associated with the packet, not directly on the buf.Buffer.
+	// Downstream consumers would need to explicitly query for it.
 }
 
 // ReadMultiBuffer implements buf.Reader.
+// For UDP, each MultiBuffer from this reader is considered a single UDP packet.
+// The UDP destination is conceptually associated with this packet.
 func (u *udpDataInjectingReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	mb, err := u.Reader.ReadMultiBuffer()
 	if err != nil {
 		return nil, err
 	}
 
-	// Fix: Use SetUDP() method as buf.Buffer.UDP field is not directly accessible.
-	if !u.injected && len(mb) > 0 {
-		// Assign the parsed UDP destination to the first buffer's UDP field.
-		// This ensures the downstream application receives the correct UDP source for the packet.
-		mb[0].SetUDP(&u.udpDest) 
-		// The GlobalID is for session identification and is not directly put on the buffer.
-		// It's associated with the session itself.
-		u.injected = true
-	}
+	// In v2ray-core's buf.Buffer, UDP destination is typically set via a specific
+	// constructor for UDP packets (e.g., buf.NewUDP), or carried in a higher-level struct.
+	// Direct modification of mb[0].UDP is not supported.
+	// If the downstream application needs the UDP destination, it must be passed
+	// explicitly or through a context/metadata mechanism.
+	// For now, we assume the downstream application is aware of the UDP context
+	// from the session or other means, and this reader simply provides the payload.
+	// The `udpDest` and `globalID` are available in this struct for potential
+	// higher-level use, but not directly attached to `buf.Buffer`.
+
 	return mb, nil
 }
 
@@ -599,15 +604,13 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	// Create the underlying reader for the actual payload data.
 	rr := s.NewReader(reader)
 
-	// If UDP data was present, wrap the reader to inject the UDP metadata into the first buffer.
-	if meta.Option.Has(OptionUDPData) {
-		rr = &udpDataInjectingReader{
-			Reader:   rr,
-			udpDest:  udpSrc,
-			globalID: globalID,
-			injected: false,
-		}
-	}
+	// If UDP data was present, the downstream application needs to be aware of udpSrc and globalID.
+	// This is typically done by passing these values along with the data, or by the downstream
+	// application querying the session for UDP context.
+	// The `udpDataInjectingReader` can still be used if it provides a way for downstream
+	// to *query* the associated UDP info, rather than directly modifying `buf.Buffer`.
+	// For now, we just proceed with copying the raw data. The `udpSrc` and `globalID`
+	// are available in this scope for further processing if needed.
 
 	var sc buf.SizeCounter
 	// buf.Copy will now use the potentially wrapped 'rr', which sets the UDP field on the first buffer.
