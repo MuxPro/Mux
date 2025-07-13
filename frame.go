@@ -12,18 +12,45 @@ import (
 	"github.com/v2fly/v2ray-core/v5/common/serial"
 )
 
+// Mux.Pro protocol version 0.0.
+// Major (2 bytes) | Minor (2 bytes)
+const (
+	Version uint32 = 0x00000000
+)
+
+// SessionStatus 定义了帧的类型和用途。
 type SessionStatus byte
 
 const (
-	SessionStatusNew       SessionStatus = 0x01
-	SessionStatusKeep      SessionStatus = 0x02
-	SessionStatusEnd       SessionStatus = 0x03
-	SessionStatusKeepAlive SessionStatus = 0x04
+	SessionStatusNegotiateVersion SessionStatus = 0x00 // Mux.Pro: 版本协商
+	SessionStatusNew              SessionStatus = 0x01 // 新建子连接
+	SessionStatusKeep             SessionStatus = 0x02 // 传输数据
+	SessionStatusEnd              SessionStatus = 0x03 // 关闭子连接
+	SessionStatusKeepAlive        SessionStatus = 0x04 // 保持主连接
+	SessionStatusCreditUpdate     SessionStatus = 0x05 // Mux.Pro: 信用更新 (流控)
 )
 
+// Option 定义了元数据中的选项位。
 const (
-	OptionData  bitmask.Byte = 0x01
+	// D (0x01): Data Present.
+	// 对于数据帧 (New, Keep)，表示有 Extra Data。
+	// 对于 End 帧，表示有 ErrorCode。
+	// 对于 NegotiateVersion 和 CreditUpdate 帧，表示有 Extra Data。
+	OptionData bitmask.Byte = 0x01
+
+	// Mux.Cool 中用于表示错误的位，在 Mux.Pro 中被 End 帧的 ErrorCode 机制取代。
 	OptionError bitmask.Byte = 0x02
+)
+
+// ErrorCode... 定义了 Mux.Pro End 帧中的错误码。
+const (
+	ErrorCodeGracefulShutdown   uint16 = 0x0000 // 正常关闭
+	ErrorCodeRemoteDisconnect   uint16 = 0x0001 // 远端目标断开连接
+	ErrorCodeOperationTimeout   uint16 = 0x0002 // 操作超时
+	ErrorCodeProtocolError      uint16 = 0x0003 // 协议错误
+	ErrorCodeResourceExhaustion uint16 = 0x0004 // 资源耗尽
+	ErrorCodeDestUnreachable    uint16 = 0x0005 // 目标不可达
+	ErrorCodeProxyRejected      uint16 = 0x0006 // 代理拒绝
 )
 
 type TargetNetwork byte
@@ -41,45 +68,64 @@ var addrParser = protocol.NewAddressParser(
 )
 
 /*
-Frame format
-2 bytes - length
-2 bytes - session id
-1 bytes - status
-1 bytes - option
+Mux.Pro Frame 格式
++-------------------+-----------------+----------------+
+| 2 字节            | L 字节          | X 字节         |
++-------------------+-----------------+----------------+
+| 元数据长度 L      | 元数据          | 额外数据       |
++-------------------+-----------------+----------------+
 
-1 byte - network
-2 bytes - port
-n bytes - address
-
+元数据 (Metadata) 格式
++-----------+---------------+-------------------+---------------------+
+| 2 字节    | 1 字节        | 1 字节            | 可变长度            |
++-----------+---------------+-------------------+---------------------+
+| ID        | 状态 S        | 选项 Opt          | 选项/字段...        |
++-----------+---------------+-------------------+---------------------+
 */
 
+// FrameMetadata 代表一个 Mux 帧的元数据部分。
 type FrameMetadata struct {
 	Target        net.Destination
 	SessionID     uint16
 	Option        bitmask.Byte
 	SessionStatus SessionStatus
+
+	// Mux.Pro 新增字段
+	Priority  byte   // 用于 New 帧
+	ErrorCode uint16 // 用于 End 帧
 }
 
-func (f FrameMetadata) WriteTo(b *buf.Buffer) error {
+// WriteTo 将元数据序列化到缓冲区中。
+func (f *FrameMetadata) WriteTo(b *buf.Buffer) error {
 	lenBytes := b.Extend(2)
-
 	len0 := b.Len()
+
 	sessionBytes := b.Extend(2)
 	binary.BigEndian.PutUint16(sessionBytes, f.SessionID)
 
 	common.Must(b.WriteByte(byte(f.SessionStatus)))
 	common.Must(b.WriteByte(byte(f.Option)))
 
-	if f.SessionStatus == SessionStatusNew {
+	switch f.SessionStatus {
+	case SessionStatusNew:
 		switch f.Target.Network {
 		case net.Network_TCP:
 			common.Must(b.WriteByte(byte(TargetNetworkTCP)))
 		case net.Network_UDP:
 			common.Must(b.WriteByte(byte(TargetNetworkUDP)))
 		}
+		// Mux.Pro: 写入优先级字段
+		common.Must(b.WriteByte(f.Priority))
 
 		if err := addrParser.WriteAddressPort(b, f.Target.Address, f.Target.Port); err != nil {
 			return err
+		}
+	case SessionStatusEnd:
+		// Mux.Pro: 对于 End 帧, Opt(D) 表示 ErrorCode 存在。
+		if f.Option.Has(OptionData) {
+			if err := WriteUint16(b, f.ErrorCode); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -88,7 +134,7 @@ func (f FrameMetadata) WriteTo(b *buf.Buffer) error {
 	return nil
 }
 
-// Unmarshal reads FrameMetadata from the given reader.
+// Unmarshal 从 reader 中读取并解析元数据。
 func (f *FrameMetadata) Unmarshal(reader io.Reader) error {
 	metaLen, err := serial.ReadUint16(reader)
 	if err != nil {
@@ -107,28 +153,35 @@ func (f *FrameMetadata) Unmarshal(reader io.Reader) error {
 	return f.UnmarshalFromBuffer(b)
 }
 
-// UnmarshalFromBuffer reads a FrameMetadata from the given buffer.
-// Visible for testing only.
+// UnmarshalFromBuffer 从给定的缓冲区中解析元数据。
 func (f *FrameMetadata) UnmarshalFromBuffer(b *buf.Buffer) error {
 	if b.Len() < 4 {
-		return newError("insufficient buffer: ", b.Len())
+		return newError("insufficient buffer for metadata header: ", b.Len())
 	}
 
-	f.SessionID = binary.BigEndian.Uint16(b.BytesTo(2))
+	f.SessionID = binary.BigEndian.Uint16(b.Bytes())
 	f.SessionStatus = SessionStatus(b.Byte(2))
 	f.Option = bitmask.Byte(b.Byte(3))
-	f.Target.Network = net.Network_Unknown
+	b.Advance(4) // 消耗已读取的头部
 
-	if f.SessionStatus == SessionStatusNew {
-		if b.Len() < 8 {
-			return newError("insufficient buffer: ", b.Len())
+	// 设置默认值
+	f.Target.Network = net.Network_Unknown
+	f.ErrorCode = ErrorCodeGracefulShutdown
+
+	switch f.SessionStatus {
+	case SessionStatusNew:
+		// 至少需要1字节网络类型和1字节优先级
+		if b.Len() < 2 {
+			return newError("insufficient buffer for New frame fields: ", b.Len())
 		}
-		network := TargetNetwork(b.Byte(4))
-		b.Advance(5)
+		network := TargetNetwork(b.Byte(0))
+		// Mux.Pro: 读取优先级字段
+		f.Priority = b.Byte(1)
+		b.Advance(2)
 
 		addr, port, err := addrParser.ReadAddressPort(nil, b)
 		if err != nil {
-			return newError("failed to parse address and port").Base(err)
+			return newError("failed to parse address and port for New frame").Base(err)
 		}
 
 		switch network {
@@ -138,6 +191,15 @@ func (f *FrameMetadata) UnmarshalFromBuffer(b *buf.Buffer) error {
 			f.Target = net.UDPDestination(addr, port)
 		default:
 			return newError("unknown network type: ", network)
+		}
+	case SessionStatusEnd:
+		// Mux.Pro: 对于 End 帧, Opt(D) 表示 ErrorCode 存在。
+		if f.Option.Has(OptionData) {
+			if b.Len() < 2 {
+				return newError("insufficient buffer for End frame error code: ", b.Len())
+			}
+			f.ErrorCode = binary.BigEndian.Uint16(b.Bytes())
+			b.Advance(2)
 		}
 	}
 
