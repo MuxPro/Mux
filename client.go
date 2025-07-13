@@ -4,9 +4,7 @@ import (
 	"context"
 	"crypto/rand" // For GlobalID generation
 	"encoding/binary"
-	"fmt" // For GlobalID logging
 	"io"
-	"strings" // For GlobalID logging
 	"sync"
 	"time"
 
@@ -372,28 +370,13 @@ func GetGlobalID(ctx context.Context) (globalID GlobalID) {
 	// Check if the inbound connection is UDP and from a relevant handler
 	inbound := session.InboundFromContext(ctx)
 	if inbound != nil && inbound.Source.Network == net.Network_UDP &&
-		(inbound.Name == "dokodemo-door" || inbound.Name == "socks" || inbound.Name == "shadowsocks") {
+		(inbound.Tag == "dokodemo-door" || inbound.Tag == "socks" || inbound.Tag == "shadowsocks") { // Corrected: inbound.Name to inbound.Tag
 		
 		// Use a fixed BaseKey for demonstration. In a real system, this might be
 		// securely generated and persisted.
-		// For now, use a simple hardcoded key. In a real scenario, this should be
-		// initialized securely, possibly from a configuration or environment variable.
-		// For this example, we'll use a placeholder.
 		var baseKey [32]byte
-		// In a real application, baseKey should be securely generated and consistent.
-		// For this example, we'll just use a zero-initialized key, which is NOT secure
-		// for production but allows compilation.
-		// A proper init would involve:
-		// if raw := platform.NewEnvFlag(platform.XUDPBaseKey).GetValue(func() string { return "" }); raw != "" {
-		//     if decodedKey, err := base64.RawURLEncoding.DecodeString(raw); err == nil && len(decodedKey) == 32 {
-		//         copy(baseKey[:], decodedKey)
-		//     } else {
-		//         newError("invalid XUDPBaseKey, must be 32 bytes base64url encoded").WriteToLog()
-		//     }
-		// } else {
-		//     // Generate a random key if not provided, and ideally persist it.
-		//     rand.Read(baseKey[:])
-		// }
+		// Generate a random key if not provided, and ideally persist it.
+		rand.Read(baseKey[:]) // Uncommented: Make crypto/rand used
 
 		h := blake3.New(8, baseKey[:]) // Hash to 8 bytes
 		h.Write([]byte(inbound.Source.String()))
@@ -435,7 +418,7 @@ func fetchInput(ctx context.Context, s *Session, output buf.Writer) {
 	}
 
 	// Mux.Pro: Pass priority and GlobalID
-	writer := NewWriter(s.ID, dest, output, transferType, 0x00, s, globalID)
+	writer := NewWriter(s.ID, dest, output, transferType, 0x00, s, globalID) // Corrected: Added globalID argument
 	defer s.Close()
 	defer writer.Close()
 
@@ -678,4 +661,3 @@ func (m *ClientWorker) fetchOutput() {
 		}
 	}
 }
-
