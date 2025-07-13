@@ -90,15 +90,16 @@ func NewServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.
 
 // handle 处理子连接的数据转发。
 func handle(ctx context.Context, s *Session, output buf.Writer) {
-	writer := NewResponseWriter(s.ID, output, s.transferType)
+	// 修正: 传入 session 参数
+	writer := NewResponseWriter(s.ID, output, s.transferType, s)
 	if err := buf.Copy(s.input, writer); err != nil {
 		newError("session ", s.ID, " ends.").Base(err).WriteToLog(session.ExportIDToError(ctx))
-		writer.SetErrorCode(ErrorCodeProtocolError) // 修正: 使用 SetErrorCode
-		writer.Close() // 修正: 不再传入错误码
+		writer.SetErrorCode(ErrorCodeProtocolError)
+		writer.Close()
 		return
 	}
 
-	writer.Close() // 修正: 不再传入错误码，默认是 GracefulShutdown
+	writer.Close() // 默认是 GracefulShutdown
 	s.Close()
 }
 
@@ -271,9 +272,10 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 
 	s, found := w.sessionManager.Get(meta.SessionID)
 	if !found {
-		closingWriter := NewResponseWriter(meta.SessionID, w.link.Writer, protocol.TransferTypeStream)
-		closingWriter.SetErrorCode(ErrorCodeProtocolError) // 修正: 使用 SetErrorCode
-		closingWriter.Close() // 修正: 不再传入错误码
+		// 修正: 传入 session 参数
+		closingWriter := NewResponseWriter(meta.SessionID, w.link.Writer, protocol.TransferTypeStream, nil) // 对于未知会话，session 可以为 nil
+		closingWriter.SetErrorCode(ErrorCodeProtocolError)
+		closingWriter.Close()
 		return buf.Copy(NewStreamReader(reader), buf.Discard)
 	}
 
@@ -281,9 +283,10 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	err := buf.Copy(rr, s.output) // 将数据从 Mux Reader 复制到会话输出流
 	if err != nil && buf.IsWriteError(err) {
 		newError("failed to write to downstream writer. closing session ", s.ID).Base(err).WriteToLog()
-		closingWriter := NewResponseWriter(meta.SessionID, w.link.Writer, protocol.TransferTypeStream)
-		closingWriter.SetErrorCode(ErrorCodeProtocolError) // 修正: 使用 SetErrorCode
-		closingWriter.Close() // 修正: 不再传入错误码
+		// 修正: 传入 session 参数
+		closingWriter := NewResponseWriter(meta.SessionID, w.link.Writer, protocol.TransferTypeStream, s)
+		closingWriter.SetErrorCode(ErrorCodeProtocolError)
+		closingWriter.Close()
 		drainErr := buf.Copy(rr, buf.Discard) // 丢弃剩余数据
 		common.Interrupt(s.input)
 		s.Close()
