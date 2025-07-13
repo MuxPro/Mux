@@ -22,6 +22,7 @@ type Writer struct {
 	currentErrorCode uint16
 	session          *Session // Mux.Pro: Reference to the associated Session for flow control
 	globalID         GlobalID // Mux.Pro: GlobalID for UDP FullCone NAT
+	packetDest       *net.Destination // Mux.Pro: For UDP packets, the actual destination address (e.g., client's original source for server responses)
 }
 
 // NewWriter creates a new Writer for sending client-initiated Mux frames.
@@ -43,6 +44,7 @@ func NewWriter(id uint16, dest net.Destination, writer buf.Writer, transferType 
 		currentErrorCode: ErrorCodeGracefulShutdown, // Mux.Pro: Default to graceful shutdown
 		session:          s,                         // Mux.Pro: Associated Session
 		globalID:         globalID,                  // Mux.Pro: GlobalID
+		packetDest:       &dest,                     // For client, packetDest is the target destination
 	}
 }
 
@@ -62,12 +64,19 @@ func NewResponseWriter(id uint16, writer buf.Writer, transferType protocol.Trans
 		currentErrorCode: ErrorCodeGracefulShutdown, // Mux.Pro: Default to graceful shutdown
 		session:          s,                         // Mux.Pro: Associated Session
 		globalID:         globalID,                  // Mux.Pro: GlobalID from client's New frame
+		// packetDest will be set by SetPacketDestination later based on GlobalID mapping
 	}
 }
 
 // SetErrorCode sets the error code to be used by the Writer upon closing.
 func (w *Writer) SetErrorCode(code uint16) {
 	w.currentErrorCode = code
+}
+
+// SetPacketDestination sets the specific destination for UDP packets.
+// This is used by the server's ResponseWriter to direct UDP responses to the client's original source.
+func (w *Writer) SetPacketDestination(dest *net.Destination) {
+	w.packetDest = dest
 }
 
 // getNextFrameMeta generates the metadata for the next Mux frame.
@@ -136,14 +145,19 @@ func (w *Writer) writeDataInternal(mb buf.MultiBuffer, packetDest *net.Destinati
 	// Mux.Pro: Handle XUDP extension for Keep frames (for UDP packet transfer type)
 	// This applies to both client sending UDP data and server sending UDP responses.
 	if meta.SessionStatus == SessionStatusKeep && w.transferType == protocol.TransferTypePacket {
-		// Check if packetDest is provided (meaning it's a UDP packet with specific address info)
-		if packetDest != nil {
+		// Use w.packetDest if it's set, otherwise fall back to w.dest (for client-side or if not explicitly set)
+		actualPacketDest := w.packetDest
+		if actualPacketDest == nil {
+			actualPacketDest = &w.dest // Fallback to the session's target
+		}
+
+		if actualPacketDest != nil {
 			meta.Option.Set(OptionUDPData) // Set the new OptionUDPData bit in metadata
 
 			addrPrefix := buf.New()
 			// XUDP format for Extra Data prefix: 1 byte network type (0x02 for UDP), then address/port
 			common.Must(addrPrefix.WriteByte(byte(TargetNetworkUDP)))
-			if err := addrParser.WriteAddressPort(addrPrefix, packetDest.Address, packetDest.Port); err != nil {
+			if err := addrParser.WriteAddressPort(addrPrefix, actualPacketDest.Address, actualPacketDest.Port); err != nil {
 				addrPrefix.Release()
 				return newError("failed to write UDP address/port prefix").Base(err)
 			}
@@ -171,7 +185,6 @@ func (w *Writer) WriteMultiBuffer(mb buf.MultiBuffer) error {
 
 	for !mb.IsEmpty() {
 		var currentChunk buf.MultiBuffer // Used to process the current chunk being sent
-		var packetDest *net.Destination // For UDP packets, this will hold the associated address/port
 
 		if w.transferType == protocol.TransferTypeStream {
 			// Stream mode splits by 8KB, or all remaining data
@@ -181,22 +194,10 @@ func (w *Writer) WriteMultiBuffer(mb buf.MultiBuffer) error {
 				currentChunk = mb
 				mb = nil // All data processed
 			}
-			packetDest = nil // No specific UDP destination for stream data
 		} else {
 			// Packet mode takes the whole MultiBuffer as one packet.
-			// The UDP metadata (source/destination for the packet) needs to be available.
-			// Since buf.MultiBuffer does not have a .UDP field in the provided definition,
-			// we temporarily use w.dest. This needs to be refined for full FullCone NAT.
 			currentChunk = mb 
 			mb = nil // All data processed for this iteration
-
-			// IMPORTANT: This is a placeholder for the actual UDP packet's source/destination.
-			// In a full XUDP implementation, this `packetDest` would come from the
-			// `buf.Buffer` itself (if it supported a .UDP field) or be passed explicitly
-			// by the upstream `buf.Reader` (e.g., a custom PacketReader).
-			// For client-side outbound UDP, w.dest is the target.
-			// For server-side inbound UDP responses, this needs to be the *source* of the response.
-			packetDest = &w.dest // Temporary: Use session's target as packet destination
 		}
 
 		chunkLen := uint32(currentChunk.Len())
@@ -214,7 +215,7 @@ func (w *Writer) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			if ok {
 				// Successfully consumed credit, send the corresponding part of the data
 				partToSend, remainingInChunk := buf.SplitSize(currentChunk, int32(consumed))
-				if err := w.writeDataInternal(partToSend, packetDest); err != nil { // Pass packetDest
+				if err := w.writeDataInternal(partToSend, w.packetDest); err != nil { // Pass w.packetDest
 					return err
 				}
 				currentChunk = remainingInChunk // Update currentChunk to the remaining unsent part
