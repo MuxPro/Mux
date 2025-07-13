@@ -1,12 +1,10 @@
 package buf
 
 import (
-	"encoding/binary"
 	"io"
 	"sync/atomic"
 	"time" // 引入 time 包
 
-	"github.com/v2fly/v2ray-core/v5/common"
 	"github.com/v2fly/v2ray-core/v5/common/errors"
 	"github.com/v2fly/v2ray-core/v5/common/net" // 引入 net 包
 	"github.com/v2fly/v2ray-core/v5/common/serial"
@@ -484,8 +482,8 @@ func CopyOnceTimeout(reader Reader, writer Writer, timeout time.Duration) error 
 	case <-timer.C:
 		return ErrReadTimeout
 	case result := <-readMultiBufferAsync(reader): // Receive the struct directly
-		if result.err != nil { // Access the error field
-			return result.err
+		if result.Err != nil { // Access the named error field (Err)
+			return result.Err
 		}
 		if result.MultiBuffer.IsEmpty() {
 			ReleaseMulti(result.MultiBuffer) // Corrected: Call as function
@@ -516,7 +514,7 @@ var ErrNotTimeoutReader = errors.New("reader is not timeout reader")
 
 type readResult struct {
 	MultiBuffer
-	error
+	Err error // Renamed the embedded error field to Err
 }
 
 func readMultiBufferAsync(reader Reader) chan readResult {
