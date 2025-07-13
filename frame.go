@@ -135,7 +135,7 @@ func (f *FrameMetadata) WriteTo(b *buf.Buffer) error {
 		}
 		// Mux.Pro: If UDP, write GlobalID
 		if f.Target.Network == net.Network_UDP && f.GlobalID != (GlobalID{}) {
-			common.Must(b.Write(f.GlobalID[:]))
+			Must2(b.Write(f.GlobalID[:]))
 		}
 	case SessionStatusEnd:
 		// Mux.Pro: For End frames, OptionData (D) indicates ErrorCode presence.
