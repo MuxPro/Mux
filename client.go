@@ -546,53 +546,52 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 		return buf.Copy(NewStreamReader(reader), buf.Discard)
 	}
 
-	rr := s.NewReader(reader)
-	var sc buf.SizeCounter // Declare a buf.SizeCounter instance
-	err := buf.Copy(rr, s.output, buf.CountSize(&sc)) // Call buf.Copy and pass CountSize option
-	copiedBytes := sc.Size // Get copied bytes from SizeCounter
+	rr := s.NewReader(reader) // This rr is a PacketReader (or StreamReader) now capable of setting UDPInfo and GlobalID on buffers.
 
-	if err != nil && buf.IsWriteError(err) {
-		newError("failed to write to downstream. closing session ", s.ID).Base(err).WriteToLog()
-		// Pass a zero GlobalID for now
-		closingWriter := NewResponseWriter(meta.SessionID, m.link.Writer, protocol.TransferTypeStream, s, GlobalID{})
-		closingWriter.SetErrorCode(ErrorCodeProtocolError)
-		closingWriter.Close()
-		drainErr := buf.Copy(rr, buf.Discard) // Discard remaining data
-		common.Interrupt(s.input)
-		s.Close()
-		return drainErr
-	}
-
-	// Mux.Pro: Receiver logic - send CreditUpdate frame
-	s.AddReceivedBytes(uint32(copiedBytes))
-	if s.GetReceivedBytes() >= CreditUpdateThreshold {
-		newError("sending credit update for session ", s.ID, ", increment: ", DefaultInitialCredit).WriteToLog()
-		// Construct CreditUpdate frame
-		creditMeta := FrameMetadata{
-			SessionID:     s.ID,
-			SessionStatus: SessionStatusCreditUpdate,
-			Option:        OptionData, // OptionData must be set as credit increment is Extra Data
+	// Instead of directly buf.Copy(rr, s.output), we need to iterate through the MultiBuffer
+	// to check for UDPInfo and GlobalID.
+	for {
+		mb, err := rr.ReadMultiBuffer() // Read one Mux packet/stream chunk
+		if err != nil {
+			if errors.Cause(err) == io.EOF {
+				return nil
+			}
+			return err
 		}
-		creditFrame := buf.New()
-		common.Must(creditMeta.WriteTo(creditFrame))
-
-		// Construct Extra Data: 4-byte credit increment
-		creditPayload := buf.New()
-		common.Must(WriteUint32(creditPayload, DefaultInitialCredit)) // Add DefaultInitialCredit credit
-		defer creditPayload.Release()
-
-		Must2(serial.WriteUint16(creditFrame, uint16(creditPayload.Len())))
-		Must2(creditFrame.Write(creditPayload.Bytes()))
-
-		// Attempt to send CreditUpdate frame
-		if writeErr := m.link.Writer.WriteMultiBuffer(buf.MultiBuffer{creditFrame}); writeErr != nil {
-			newError("failed to send CreditUpdate frame for session ", s.ID).Base(writeErr).WriteToLog()
-		} else {
-			s.ResetReceivedBytes() // Reset count after successful send
+		if mb.IsEmpty() {
+			mb.ReleaseMulti()
+			continue
 		}
-	}
 
-	return err
+		// Iterate through individual buffers in the MultiBuffer
+		for _, b := range mb {
+			if b.UDPInfo != nil && b.UDPInfo.Network == net.Network_UDP {
+				// This is a UDP packet with source address from the server.
+				// s.output needs to be able to handle this.
+				// For now, we'll just write the data, but in a real UDP stack,
+				// s.output (e.g., a UDP connection) would use b.UDPInfo as the source
+				// for sending to the client, and b.GlobalID for identification.
+				//
+				// Placeholder: A real UDP output might look like:
+				// s.output.WriteUDP(b.Bytes(), b.UDPInfo.Address, b.UDPInfo.Port, b.GlobalID)
+				//
+				// For now, we'll just write the data to the stream, assuming the downstream
+				// application can interpret it or this is a simplified example.
+				newError("Client received UDP response from ", b.UDPInfo.Address, ":", b.UDPInfo.Port, " with GlobalID: ", b.GlobalID).WriteToLog()
+				if writeErr := s.output.WriteMultiBuffer(buf.MultiBuffer{b}); writeErr != nil {
+					newError("failed to write UDP data to downstream").Base(writeErr).WriteToLog()
+					return writeErr
+				}
+			} else {
+				// Regular stream data or non-UDP packet
+				if writeErr := s.output.WriteMultiBuffer(buf.MultiBuffer{b}); writeErr != nil {
+					newError("failed to write stream data to downstream").Base(writeErr).WriteToLog()
+					return writeErr
+				}
+			}
+		}
+		mb.ReleaseMulti() // Release the MultiBuffer after processing
+	}
 }
 
 // handleStatusEnd handles End frames (closing sub-connection).
