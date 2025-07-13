@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"io"
+	"sync" // For the GlobalID map
 
 	core "github.com/v2fly/v2ray-core/v5"
 	"github.com/v2fly/v2ray-core/v5/common"
@@ -46,7 +47,7 @@ func (s *Server) Dispatch(ctx context.Context, dest net.Destination) (*transport
 	}
 
 	opts := pipe.OptionsFromContext(ctx)
-	uplinkReader, uplinkWriter := pipe.New(opts...)
+	uplinkReader, upLinkWriter := pipe.New(opts...)
 	downlinkReader, downlinkWriter := pipe.New(opts...)
 
 	_, err := NewServerWorker(ctx, s.dispatcher, &transport.Link{
@@ -75,6 +76,10 @@ type ServerWorker struct {
 	dispatcher     routing.Dispatcher
 	link           *transport.Link
 	sessionManager *SessionManager
+
+	// Mux.Pro: Mapping for UDP FullCone NAT.
+	// globalIDToSource maps GlobalID to the original client's UDP source address.
+	globalIDToSource sync.Map // map[GlobalID]net.Destination
 }
 
 // NewServerWorker creates a new ServerWorker.
@@ -83,25 +88,81 @@ func NewServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.
 		dispatcher:     d,
 		link:           link,
 		sessionManager: NewSessionManager(),
+		globalIDToSource: sync.Map{}, // Initialize the map for GlobalID to source mapping
 	}
 	go worker.run(ctx) // Start the main loop
 	return worker, nil
 }
 
 // handle handles data forwarding for sub-connections.
-func handle(ctx context.Context, s *Session, output buf.Writer) {
-	// Pass a zero GlobalID for now; actual GlobalID will be extracted from New frame in future stages
-	writer := NewResponseWriter(s.ID, output, s.transferType, s, GlobalID{})
-	if err := buf.Copy(s.input, writer); err != nil { // buf.Copy returns only error
-		newError("session ", s.ID, " ends.").Base(err).WriteToLog(session.ExportIDToError(ctx))
-		writer.SetErrorCode(ErrorCodeProtocolError)
-		writer.Close()
-		return
+// This function is responsible for copying data from the upstream (target server)
+// to the downstream (Mux main connection back to client).
+// For UDP, it needs to embed the target server's response source and GlobalID.
+func handle(ctx context.Context, s *Session, output buf.Writer, worker *ServerWorker) {
+	// The ResponseWriter will be responsible for attaching the correct UDP source from
+	// the upstream response and the session's GlobalID when it writes a Keep frame.
+	writer := NewResponseWriter(s.ID, output, s.transferType, s, s.globalID) // Pass GlobalID from session
+	defer s.Close()
+	defer writer.Close()
+
+	// If it's a UDP session, we need to read from s.input (which is the actual UDP connection to target)
+	// and then extract the source UDP address from the received buffers, and embed it in the Keep frame.
+	if s.transferType == protocol.TransferTypePacket {
+		for {
+			select {
+			case <-s.Done():
+				return // Session closed
+			default:
+				mb, err := s.input.ReadMultiBuffer() // Read from actual UDP connection (upstream)
+				if err != nil {
+					if errors.Cause(err) != io.EOF {
+						newError("failed to read from UDP upstream for session ", s.ID).Base(err).WriteToLog(session.ExportIDToError(ctx))
+					}
+					writer.SetErrorCode(ErrorCodeProtocolError)
+					return // End of upstream, close session
+				}
+				defer mb.Release()
+
+				if mb.IsEmpty() {
+					continue
+				}
+
+				// Each buffer in the MultiBuffer represents a UDP packet from the target.
+				// Extract the UDP source from the buffer itself if available.
+				// For a single UDP packet, we typically expect one buffer.
+				if len(mb) > 0 && mb[0].UDP != nil {
+					// The UDP field in buf.Buffer stores the source of the UDP packet from the target server.
+					// We need to include this in the Mux.Pro Keep frame as Extra Data.
+					// Set the response UDP info on the writer.
+					writer.SetResponseUDPInfo(s.globalID, *mb[0].UDP)
+					newError("Sending UDP response for session ", s.ID, " from target ", *mb[0].UDP, " with GlobalID ", s.globalID).WriteToLog(session.ExportIDToError(ctx))
+				} else {
+					// If UDP packet but no UDP info from upstream, it's an error or unexpected.
+					newError("UDP packet for session ", s.ID, " has no source UDP info from upstream").AtWarning().WriteToLog(session.ExportIDToError(ctx))
+					writer.SetErrorCode(ErrorCodeProtocolError) // Indicate protocol error
+				}
+
+				if err := writer.WriteMultiBuffer(mb); err != nil {
+					newError("failed to write UDP response to mux link for session ", s.ID).Base(err).WriteToLog(session.ExportIDToError(ctx))
+					writer.SetErrorCode(ErrorCodeProtocolError)
+					return
+				}
+			}
+		}
+	} else {
+		// Existing stream handling logic for TCP/stream connections
+		if err := buf.Copy(s.input, writer); err != nil { // buf.Copy returns only error
+			newError("session ", s.ID, " ends.").Base(err).WriteToLog(session.ExportIDToError(ctx))
+			writer.SetErrorCode(ErrorCodeProtocolError)
+			writer.Close()
+			return
+		}
 	}
 
 	writer.Close() // Default is GracefulShutdown
 	s.Close()
 }
+
 
 // ActiveConnections returns the number of active connections.
 func (w *ServerWorker) ActiveConnections() uint32 {
@@ -159,7 +220,7 @@ func (w *ServerWorker) negotiate(reader *buf.BufferedReader) error {
 
 	var negotiatedVersion uint32
 	var found bool
-	supportedVersions := []uint32{Version} // Server's supported version list (currently only Mux.Pro 0.0)
+	supportedVersions := []uint32{Version} // Server's supported version list (currently only Mux.Pro 0.1)
 
 	// Iterate through client versions to find the highest common version
 	for _, clientVer := range clientVersions {
@@ -265,6 +326,24 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 		}
 		ctx = log.ContextWithAccessMessage(ctx, msg)
 	}
+
+	var clientOriginalUDPSource net.Destination // Original UDP source from the client
+	var globalID GlobalID
+
+	// If it's a UDP connection, extract GlobalID from FrameMetadata.
+	if meta.Target.Network == net.Network_UDP {
+		globalID = meta.GlobalID // GlobalID is already part of FrameMetadata for New frames
+		inbound := session.InboundFromContext(ctx)
+		if inbound != nil && inbound.Source.Network == net.Network_UDP {
+			clientOriginalUDPSource = inbound.Source
+			// Store GlobalID to original client's UDP source mapping
+			w.globalIDToSource.Store(globalID, clientOriginalUDPSource)
+			newError("Stored GlobalID ", globalID, " for client UDP source ", clientOriginalUDPSource).WriteToLog(session.ExportIDToError(ctx))
+		} else {
+			newError("UDP New frame but no valid inbound UDP source for GlobalID ", globalID).AtWarning().WriteToLog(session.ExportIDToError(ctx))
+		}
+	}
+
 	link, err := w.dispatcher.Dispatch(ctx, meta.Target)
 	if err != nil {
 		if meta.Option.Has(OptionData) { // If New frame contains initial data, discard it
@@ -281,12 +360,15 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 		sendCredit: DefaultInitialCredit, // Mux.Pro: Server-side new sessions also need initial credit
 		creditUpdate: make(chan struct{}, 1),
 		receivedBytes: 0,
+		// Mux.Pro: Associate GlobalID and original client source with the session
+		globalID:       globalID,
+		originalSource: clientOriginalUDPSource,
 	}
 	if meta.Target.Network == net.Network_UDP {
 		s.transferType = protocol.TransferTypePacket
 	}
 	w.sessionManager.Add(s)
-	go handle(ctx, s, w.link.Writer) // Start data forwarding for sub-connection
+	go handle(ctx, s, w.link.Writer, w) // Pass worker to handle function
 	if !meta.Option.Has(OptionData) {
 		return nil
 	}
@@ -300,7 +382,9 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 	return nil
 }
 
-// handleStatusKeep handles Keep frames (data transfer).
+// handleStatusKeep handles Keep frames (data transfer from client to server).
+// This function does not expect UDP source metadata in incoming Keep frames
+// as the client's original UDP source for the session is established in the New frame.
 func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.BufferedReader) error {
 	if !meta.Option.Has(OptionData) {
 		return nil
@@ -308,25 +392,24 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 
 	s, found := w.sessionManager.Get(meta.SessionID)
 	if !found {
-		// Pass a zero GlobalID for now; actual GlobalID will be extracted from Keep frame in future stages
-		closingWriter := NewResponseWriter(meta.SessionID, w.link.Writer, protocol.TransferTypeStream, nil, GlobalID{}) 
+		// If session not found, discard the entire frame.
+		closingWriter := NewResponseWriter(meta.SessionID, w.link.Writer, protocol.TransferTypeStream, nil, GlobalID{})
 		closingWriter.SetErrorCode(ErrorCodeProtocolError)
 		closingWriter.Close()
 		return buf.Copy(NewStreamReader(reader), buf.Discard)
 	}
 
 	rr := s.NewReader(reader)
-	var sc buf.SizeCounter // Declare a buf.SizeCounter instance
-	err := buf.Copy(rr, s.output, buf.CountSize(&sc)) // Call buf.Copy and pass CountSize option
-	copiedBytes := sc.Size // Get copied bytes from SizeCounter
+	var sc buf.SizeCounter
+	err := buf.Copy(rr, s.output, buf.CountSize(&sc))
+	copiedBytes := sc.Size
 
 	if err != nil && buf.IsWriteError(err) {
 		newError("failed to write to downstream writer. closing session ", s.ID).Base(err).WriteToLog()
-		// Pass a zero GlobalID for now
 		closingWriter := NewResponseWriter(meta.SessionID, w.link.Writer, protocol.TransferTypeStream, s, GlobalID{})
 		closingWriter.SetErrorCode(ErrorCodeProtocolError)
 		closingWriter.Close()
-		drainErr := buf.Copy(rr, buf.Discard) // Discard remaining data
+		drainErr := buf.Copy(rr, buf.Discard)
 		common.Interrupt(s.input)
 		s.Close()
 		return drainErr
