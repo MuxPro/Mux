@@ -237,7 +237,7 @@ func (m *ClientWorker) NegotiateAndStart() error {
 	defer versionsPayload.Release()
 
 	// 写入 Extra Data 的长度和内容
-	common.Must(serial.WriteUint16(frame, uint16(versionsPayload.Len())))
+	Must2(serial.WriteUint16(frame, uint16(versionsPayload.Len())))
 	frame.WriteAll(versionsPayload.Bytes())
 
 	if err := m.link.Writer.WriteMultiBuffer(buf.MultiBuffer{frame}); err != nil {
