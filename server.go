@@ -40,25 +40,20 @@ func (s *Server) Type() interface{} {
 }
 
 // Dispatch handles inbound connections.
-func (s *Server) Dispatch(ctx context.Context, dest net.Destination) (*transport.Link, error) {
-	// Mux.Pro: Check if the target address is "mux.pro"
-	if dest.Address != muxProAddress {
-		return s.dispatcher.Dispatch(ctx, dest)
-	}
+// This method is called when a new main Mux connection is established from a client.
+func (s *Server) Dispatch(ctx context.Context, link *transport.Link) error { // 'link' is the main Mux connection
+	// The `dest` parameter from the previous signature is removed as it's not applicable
+	// for an inbound handler that takes the direct connection.
+	// The `muxProAddress` check would typically be handled by an inbound proxy (e.g., Dokodemo-door)
+	// that routes to this Mux server based on configuration.
 
-	opts := pipe.OptionsFromContext(ctx)
-	uplinkReader, upLinkWriter := pipe.New(opts...)
-	downlinkReader, downlinkWriter := pipe.New(opts...)
-
-	_, err := NewServerWorker(ctx, s.dispatcher, &transport.Link{
-		Reader: uplinkReader,
-		Writer: downlinkWriter,
-	})
+	// Create a new ServerWorker to handle this main Mux connection.
+	_, err := NewServerWorker(ctx, s.dispatcher, link) // Pass the main Mux link directly
 	if err != nil {
-		return nil, err
+		return newError("failed to create Mux ServerWorker").Base(err)
 	}
-
-	return &transport.Link{Reader: downlinkReader, Writer: uplinkWriter}, nil
+	// The ServerWorker runs in its own goroutine to handle frames.
+	return nil
 }
 
 // Start starts the server.
@@ -130,12 +125,13 @@ func handle(ctx context.Context, s *Session, output buf.Writer, worker *ServerWo
 				// Each buffer in the MultiBuffer represents a UDP packet from the target.
 				// Extract the UDP source from the buffer itself if available.
 				// For a single UDP packet, we typically expect one buffer.
-				if len(mb) > 0 && mb[0].UDP != nil {
+				// Fix: Use UDP() method to access the UDP destination from buf.Buffer
+				if len(mb) > 0 && mb[0].UDP() != nil {
 					// The UDP field in buf.Buffer stores the source of the UDP packet from the target server.
 					// We need to include this in the Mux.Pro Keep frame as Extra Data.
 					// Set the response UDP info on the writer.
-					writer.SetResponseUDPInfo(s.globalID, *mb[0].UDP)
-					newError("Sending UDP response for session ", s.ID, " from target ", *mb[0].UDP, " with GlobalID ", s.globalID).WriteToLog(session.ExportIDToError(ctx))
+					writer.SetResponseUDPInfo(s.globalID, *mb[0].UDP()) // Fix: Use UDP() method to get the value
+					newError("Sending UDP response for session ", s.ID, " from target ", *mb[0].UDP(), " with GlobalID ", s.globalID).WriteToLog(session.ExportIDToError(ctx))
 				} else {
 					// If UDP packet but no UDP info from upstream, it's an error or unexpected.
 					newError("UDP packet for session ", s.ID, " has no source UDP info from upstream").AtWarning().WriteToLog(session.ExportIDToError(ctx))
@@ -267,8 +263,8 @@ func (w *ServerWorker) negotiate(reader *buf.BufferedReader) error {
 	return nil
 }
 
-// handleStatusKeepAlive handles KeepAlive frames.
-func (w *ServerWorker) handleStatusKeepAlive(meta *FrameMetadata, reader *buf.BufferedReader) error {
+// handleStatueKeepAlive handles KeepAlive frames.
+func (w *ServerWorker) handleStatueKeepAlive(meta *FrameMetadata, reader *buf.BufferedReader) error {
 	// Mux.Pro: KeepAlive frame's Opt must be 0x00 and carry no data.
 	if meta.Option != 0 {
 		return newError("protocol error: KeepAlive frame with non-zero option: ", meta.Option)
