@@ -124,50 +124,46 @@ func (w *Writer) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	}
 
 	for !mb.IsEmpty() {
-		var chunk buf.MultiBuffer
+		var currentChunk buf.MultiBuffer // 用于处理当前正在发送的块
 		if w.transferType == protocol.TransferTypeStream {
 			// 流模式按 8KB 分割，或者剩余所有数据
 			if mb.Len() > 8*1024 {
-				mb, chunk = buf.SplitSize(mb, 8*1024)
+				currentChunk, mb = buf.SplitSize(mb, 8*1024)
 			} else {
-				chunk = mb
+				currentChunk = mb
 				mb = nil // 所有数据都已处理
 			}
 		} else {
 			// 包模式取第一个包
-			mb2, b := buf.SplitFirst(mb)
-			mb = mb2
-			chunk = buf.MultiBuffer{b}
+			currentChunk, mb = buf.SplitFirst(mb)
 		}
 
-		// Mux.Pro: Credit-based flow control for each chunk
-		chunkLen := uint32(chunk.Len())
+		chunkLen := uint32(currentChunk.Len())
 		if chunkLen == 0 { // 空块，直接跳过
 			continue
 		}
 
-		for { // 循环直到成功消费信用并发送数据
+		for chunkLen > 0 { // 循环直到当前块完全发送
+			// Mux.Pro: 在尝试消费信用或等待之前，检查 SessionManager 是否正在关闭
+			if w.session.parent.Closed() {
+				return newError("session manager closed while waiting for credit for session ", w.id).AtWarning()
+			}
+
 			consumed, ok := w.session.ConsumeCredit(chunkLen)
 			if ok {
 				// 成功消费了信用，发送相应部分的数据
-				partToSend := buf.SplitSize(chunk, int32(consumed))
+				partToSend, remainingInChunk := buf.SplitSize(currentChunk, int32(consumed))
 				if err := w.writeDataInternal(partToSend); err != nil {
 					return err
 				}
-				chunk = chunk.SliceFrom(int32(consumed)) // 更新 chunk 为剩余未发送的数据
+				currentChunk = remainingInChunk // 更新 currentChunk 为剩余未发送的部分
 				chunkLen -= consumed
-				if chunkLen == 0 { // 当前 chunk 已全部发送
-					break // 跳出内部循环，处理下一个原始 mb 的 chunk
-				}
 			} else {
-				// 没有信用可消费，等待信用更新信号
+				// 没有信用可消费，等待信用更新信号或超时
 				select {
 				case <-w.session.creditUpdate:
 					// 收到信用更新信号，继续尝试消费信用
 					continue
-				case <-w.session.parent.CloseIfNoSession(): // 检查 SessionManager 是否正在关闭
-					// 如果 SessionManager 正在关闭，则停止等待并返回错误
-					return newError("session manager closing while waiting for credit for session ", w.id).AtWarning()
 				case <-time.After(time.Second * 30): // 设置超时，防止无限期阻塞
 					return newError("writer for session ", w.id, " blocked due to no credit, timed out").AtWarning()
 				}
