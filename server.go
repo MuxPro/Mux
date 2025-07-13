@@ -1,3 +1,4 @@
+// server.go
 package mux
 
 import (
@@ -308,11 +309,16 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 
 	s, found := w.sessionManager.Get(meta.SessionID)
 	if !found {
-		// Pass a zero GlobalID for now; actual GlobalID will be extracted from Keep frame in future stages
-		closingWriter := NewResponseWriter(meta.SessionID, w.link.Writer, protocol.TransferTypeStream, nil, GlobalID{}) 
+		// Determine transferType for closingWriter based on the incoming frame's target
+		tt := protocol.TransferTypeStream
+		if meta.Target.Network == net.Network_UDP { // If the original frame's target was UDP
+			tt = protocol.TransferTypePacket
+		}
+		// Pass the GlobalID from the incoming frame's metadata to the closingWriter
+		closingWriter := NewResponseWriter(meta.SessionID, w.link.Writer, tt, nil, meta.GlobalID)
 		closingWriter.SetErrorCode(ErrorCodeProtocolError)
 		closingWriter.Close()
-		return buf.Copy(NewStreamReader(reader), buf.Discard)
+		return buf.Copy(NewStreamReader(reader), buf.Discard) // Discard remaining data
 	}
 
 	rr := s.NewReader(reader)
@@ -322,8 +328,8 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 
 	if err != nil && buf.IsWriteError(err) {
 		newError("failed to write to downstream writer. closing session ", s.ID).Base(err).WriteToLog()
-		// Pass a zero GlobalID for now
-		closingWriter := NewResponseWriter(meta.SessionID, w.link.Writer, protocol.TransferTypeStream, s, GlobalID{})
+		// Pass the GlobalID from the original meta to the closingWriter, and use session's transferType
+		closingWriter := NewResponseWriter(meta.SessionID, w.link.Writer, s.transferType, s, meta.GlobalID)
 		closingWriter.SetErrorCode(ErrorCodeProtocolError)
 		closingWriter.Close()
 		drainErr := buf.Copy(rr, buf.Discard) // Discard remaining data

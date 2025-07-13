@@ -1,3 +1,4 @@
+// writer.go
 package mux
 
 import (
