@@ -372,19 +372,21 @@ func fetchInput(ctx context.Context, s *Session, output buf.Writer) {
 	// Mux.Pro: 传递优先级，默认为 0x00 (最高优先级)
 	writer := NewWriter(s.ID, dest, output, transferType, 0x00)
 	defer s.Close()
-	defer writer.Close(ErrorCodeGracefulShutdown) // Mux.Pro: 使用 ErrorCodeGracefulShutdown 关闭
+	defer writer.Close() // 修正: 不再传入错误码
 
 	newError("dispatching request to ", dest).WriteToLog(session.ExportIDToError(ctx))
 	if err := writeFirstPayload(s.input, writer); err != nil {
 		newError("failed to write first payload").Base(err).WriteToLog(session.ExportIDToError(ctx))
-		writer.Close(ErrorCodeProtocolError) // Mux.Pro: 发生错误时关闭，带上错误码
+		writer.SetErrorCode(ErrorCodeProtocolError) // 修正: 使用 SetErrorCode
+		writer.Close() // 修正: 不再传入错误码
 		common.Interrupt(s.input)
 		return
 	}
 
 	if err := buf.Copy(s.input, writer); err != nil {
 		newError("failed to fetch all input").Base(err).WriteToLog(session.ExportIDToError(ctx))
-		writer.Close(ErrorCodeProtocolError) // Mux.Pro: 发生错误时关闭，带上错误码
+		writer.SetErrorCode(ErrorCodeProtocolError) // 修正: 使用 SetErrorCode
+		writer.Close() // 修正: 不再传入错误码
 		common.Interrupt(s.input)
 		return
 	}
@@ -462,7 +464,8 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	s, found := m.sessionManager.Get(meta.SessionID)
 	if !found {
 		closingWriter := NewResponseWriter(meta.SessionID, m.link.Writer, protocol.TransferTypeStream)
-		closingWriter.Close() // 关闭一个不存在的会话
+		closingWriter.SetErrorCode(ErrorCodeProtocolError) // 修正: 使用 SetErrorCode
+		closingWriter.Close() // 修正: 不再传入错误码
 		return buf.Copy(NewStreamReader(reader), buf.Discard)
 	}
 
@@ -471,7 +474,8 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	if err != nil && buf.IsWriteError(err) {
 		newError("failed to write to downstream. closing session ", s.ID).Base(err).WriteToLog()
 		closingWriter := NewResponseWriter(meta.SessionID, m.link.Writer, protocol.TransferTypeStream)
-		closingWriter.Close()
+		closingWriter.SetErrorCode(ErrorCodeProtocolError) // 修正: 使用 SetErrorCode
+		closingWriter.Close() // 修正: 不再传入错误码
 		drainErr := buf.Copy(rr, buf.Discard) // 丢弃剩余数据
 		common.Interrupt(s.input)
 		s.Close()
