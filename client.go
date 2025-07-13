@@ -22,15 +22,15 @@ import (
 	"github.com/v2fly/v2ray-core/v5/transport/pipe"
 )
 
-// ClientManager 管理 Mux 客户端工作器。
+// ClientManager manages Mux client workers.
 type ClientManager struct {
-	Enabled bool // 是否在用户配置中启用 Mux
+	Enabled bool // whether mux is enabled from user config
 	Picker  WorkerPicker
 }
 
-// Dispatch 将链接分派给可用的 Mux 客户端工作器。
+// Dispatch dispatches a link to an available Mux client worker.
 func (m *ClientManager) Dispatch(ctx context.Context, link *transport.Link) error {
-	for i := 0; i < 16; i++ { // 尝试 16 次寻找可用工作器
+	for i := 0; i < 16; i++ { // Try 16 times to find an available worker
 		worker, err := m.Picker.PickAvailable()
 		if err != nil {
 			return err
@@ -43,12 +43,12 @@ func (m *ClientManager) Dispatch(ctx context.Context, link *transport.Link) erro
 	return newError("unable to find an available mux client").AtWarning()
 }
 
-// WorkerPicker 接口定义了选择可用工作器的方法。
+// WorkerPicker interface defines methods to pick an available worker.
 type WorkerPicker interface {
 	PickAvailable() (*ClientWorker, error)
 }
 
-// IncrementalWorkerPicker 实现了 WorkerPicker 接口，按需创建和管理工作器。
+// IncrementalWorkerPicker implements WorkerPicker interface, creating and managing workers on demand.
 type IncrementalWorkerPicker struct {
 	Factory ClientWorkerFactory
 
@@ -57,7 +57,7 @@ type IncrementalWorkerPicker struct {
 	cleanupTask *task.Periodic
 }
 
-// cleanupFunc 定期清理已关闭的工作器。
+// cleanupFunc periodically cleans up closed workers.
 func (p *IncrementalWorkerPicker) cleanupFunc() error {
 	p.access.Lock()
 	defer p.access.Unlock()
@@ -70,7 +70,7 @@ func (p *IncrementalWorkerPicker) cleanupFunc() error {
 	return nil
 }
 
-// cleanup 移除已关闭的工作器。
+// cleanup removes closed workers.
 func (p *IncrementalWorkerPicker) cleanup() {
 	var activeWorkers []*ClientWorker
 	for _, w := range p.workers {
@@ -81,7 +81,7 @@ func (p *IncrementalWorkerPicker) cleanup() {
 	p.workers = activeWorkers
 }
 
-// findAvailable 查找一个未满的工作器。
+// findAvailable finds a worker that is not full.
 func (p *IncrementalWorkerPicker) findAvailable() int {
 	for idx, w := range p.workers {
 		if !w.IsFull() {
@@ -92,22 +92,22 @@ func (p *IncrementalWorkerPicker) findAvailable() int {
 	return -1
 }
 
-// pickInternal 内部方法，用于选择或创建工作器。
-func (p *IncrementalWorkerPicker) pickInternal() (*ClientWorker, bool, error) {
+// pickInternal is an internal method to pick or create a worker.
+func (p *IncrementalWorker) pickInternal() (*ClientWorker, bool, error) {
 	p.access.Lock()
 	defer p.access.Unlock()
 
 	idx := p.findAvailable()
 	if idx >= 0 {
 		n := len(p.workers)
-		// 将找到的可用工作器移到切片末尾，优化后续查找。
+		// Move the found available worker to the end of the slice for optimization.
 		if n > 1 && idx != n-1 {
 			p.workers[n-1], p.workers[idx] = p.workers[idx], p.workers[n-1]
 		}
 		return p.workers[idx], false, nil
 	}
 
-	p.cleanup() // 清理后再尝试创建新的
+	p.cleanup() // Clean up before trying to create a new one
 
 	worker, err := p.Factory.Create()
 	if err != nil {
@@ -117,7 +117,7 @@ func (p *IncrementalWorkerPicker) pickInternal() (*ClientWorker, bool, error) {
 
 	if p.cleanupTask == nil {
 		p.cleanupTask = &task.Periodic{
-			Interval: time.Second * 30, // 每 30 秒清理一次
+			Interval: time.Second * 30, // Clean up every 30 seconds
 			Execute:  p.cleanupFunc,
 		}
 	}
@@ -125,22 +125,22 @@ func (p *IncrementalWorkerPicker) pickInternal() (*ClientWorker, bool, error) {
 	return worker, true, nil
 }
 
-// PickAvailable 选择一个可用的 Mux 客户端工作器。
+// PickAvailable picks an available Mux client worker.
 func (p *IncrementalWorkerPicker) PickAvailable() (*ClientWorker, error) {
 	worker, start, err := p.pickInternal()
 	if start {
-		common.Must(p.cleanupTask.Start()) // 如果是新创建的工作器，启动清理任务
+		common.Must(p.cleanupTask.Start()) // If a new worker is created, start the cleanup task
 	}
 
 	return worker, err
 }
 
-// ClientWorkerFactory 接口定义了创建 Mux 客户端工作器的方法。
+// ClientWorkerFactory interface defines methods to create Mux client workers.
 type ClientWorkerFactory interface {
 	Create() (*ClientWorker, error)
 }
 
-// DialingWorkerFactory 实现了 ClientWorkerFactory 接口，通过拨号创建工作器。
+// DialingWorkerFactory implements ClientWorkerFactory interface, creating workers by dialing.
 type DialingWorkerFactory struct {
 	Proxy    proxy.Outbound
 	Dialer   internet.Dialer
@@ -149,7 +149,7 @@ type DialingWorkerFactory struct {
 	ctx context.Context
 }
 
-// NewDialingWorkerFactory 创建一个新的 DialingWorkerFactory。
+// NewDialingWorkerFactory creates a new DialingWorkerFactory.
 func NewDialingWorkerFactory(ctx context.Context, proxy proxy.Outbound, dialer internet.Dialer, strategy ClientStrategy) *DialingWorkerFactory {
 	return &DialingWorkerFactory{
 		Proxy:    proxy,
@@ -160,14 +160,14 @@ func NewDialingWorkerFactory(ctx context.Context, proxy proxy.Outbound, dialer i
 }
 
 var (
-	// muxProAddress 是 Mux.Pro 连接的目标地址。
+	// muxProAddress is the target address for Mux.Pro connections.
 	muxProAddress = net.DomainAddress("mux.pro")
-	muxProPort    = net.Port(9527) // Mux.Pro 建议的端口，实际可能根据配置变化
+	muxProPort    = net.Port(9527) // Mux.Pro suggested port, may change based on configuration
 )
 
-// Create 创建一个新的 Mux 客户端工作器。
+// Create creates a new Mux client worker.
 func (f *DialingWorkerFactory) Create() (*ClientWorker, error) {
-	opts := []pipe.Option{pipe.WithSizeLimit(64 * 1024)} // 管道大小限制
+	opts := []pipe.Option{pipe.WithSizeLimit(64 * 1024)} // Pipe size limit
 	uplinkReader, upLinkWriter := pipe.New(opts...)
 	downlinkReader, downlinkWriter := pipe.New(opts...)
 
@@ -179,10 +179,10 @@ func (f *DialingWorkerFactory) Create() (*ClientWorker, error) {
 		return nil, err
 	}
 
-	// 启动一个 goroutine 来处理底层连接的建立和数据转发。
+	// Start a goroutine to handle underlying connection establishment and data forwarding.
 	go func(p proxy.Outbound, d internet.Dialer, c common.Closable) {
 		ctx := session.ContextWithOutbound(f.ctx, &session.Outbound{
-			// Mux.Pro: 使用 "mux.pro" 作为特殊目标地址
+			// Mux.Pro: Use "mux.pro" as a special target address
 			Target: net.TCPDestination(muxProAddress, muxProPort),
 		})
 		ctx, cancel := context.WithCancel(ctx)
@@ -194,31 +194,31 @@ func (f *DialingWorkerFactory) Create() (*ClientWorker, error) {
 		}
 	}(f.Proxy, f.Dialer, c.done)
 
-	// 阻塞地执行版本协商，协商成功后启动 worker 的主循环。
+	// Perform version negotiation blocking, then start the worker's main loop upon successful negotiation.
 	if err := c.NegotiateAndStart(); err != nil {
-		c.done.Close() // 确保在协商失败时关闭 worker
+		c.done.Close() // Ensure worker is closed if negotiation fails
 		return nil, newError("Mux.Pro negotiation failed").Base(err)
 	}
 
 	return c, nil
 }
 
-// ClientStrategy 定义了客户端的策略，如最大并发连接数。
+// ClientStrategy defines client strategies, such as max concurrent connections.
 type ClientStrategy struct {
 	MaxConcurrency uint32
 	MaxConnection  uint32
 }
 
-// ClientWorker 代表一个 Mux 主连接的客户端端。
+// ClientWorker represents the client side of a Mux main connection.
 type ClientWorker struct {
 	sessionManager *SessionManager
 	link           transport.Link
 	done           *done.Instance
 	strategy       ClientStrategy
-	negotiated     bool // Mux.Pro: 标记是否已完成版本协商
+	negotiated     bool // Mux.Pro: Flag indicating if version negotiation is complete
 }
 
-// NewClientWorker 创建一个新的 mux.ClientWorker。
+// NewClientWorker creates a new mux.ClientWorker.
 func NewClientWorker(stream transport.Link, s ClientStrategy) (*ClientWorker, error) {
 	c := &ClientWorker{
 		sessionManager: NewSessionManager(),
@@ -229,61 +229,61 @@ func NewClientWorker(stream transport.Link, s ClientStrategy) (*ClientWorker, er
 	return c, nil
 }
 
-// start 启动 worker 的主处理循环。
+// start starts the worker's main processing loop.
 func (m *ClientWorker) start() {
-	go m.fetchOutput() // 接收服务器响应
-	go m.monitor()     // 监控会话状态
+	go m.fetchOutput() // Receive server responses
+	go m.monitor()     // Monitor session status
 }
 
-// NegotiateAndStart 执行 Mux.Pro 版本协商，成功后启动 worker。
+// NegotiateAndStart performs Mux.Pro version negotiation and starts the worker upon success.
 func (m *ClientWorker) NegotiateAndStart() error {
-	// 1. 发送客户端支持的版本列表
+	// 1. Send client's supported version list
 	meta := FrameMetadata{
-		SessionID:     0, // 版本协商使用主连接 ID 0x0000
+		SessionID:     0, // Version negotiation uses main connection ID 0x0000
 		SessionStatus: SessionStatusNegotiateVersion,
-		Option:        OptionData, // 必须设置 OptionData，因为版本列表是 Extra Data
+		Option:        OptionData, // OptionData must be set as version list is Extra Data
 	}
 
 	frame := buf.New()
 	common.Must(meta.WriteTo(frame))
 
-	// 构造版本协商的 Extra Data: [1字节版本数量 N] [N * 4字节版本号]
+	// Construct Extra Data for version negotiation: [1-byte version count N] [N * 4-byte version numbers]
 	versionsPayload := buf.New()
-	common.Must(versionsPayload.WriteByte(1))                 // 版本数量 N = 1
-	common.Must(WriteUint32(versionsPayload, Version)) // 写入当前 Mux.Pro 版本号
+	common.Must(versionsPayload.WriteByte(1))                 // Version count N = 1
+	common.Must(WriteUint32(versionsPayload, Version)) // Write current Mux.Pro version number
 	defer versionsPayload.Release()
 
-	// 写入 Extra Data 的长度和内容
-	Must2(serial.WriteUint16(frame, uint16(versionsPayload.Len()))) // 写入 Extra Data 的长度
-	Must2(frame.Write(versionsPayload.Bytes()))                     // 写入 Extra Data 的内容
+	// Write Extra Data length and content
+	common.Must(serial.WriteUint16(frame, uint16(versionsPayload.Len()))) // Write Extra Data length
+	common.Must(frame.Write(versionsPayload.Bytes()))                     // Write Extra Data content
 
 	if err := m.link.Writer.WriteMultiBuffer(buf.MultiBuffer{frame}); err != nil {
 		return newError("failed to write negotiation request").Base(err)
 	}
 
-	// 2. 读取并解析服务器的响应
+	// 2. Read and parse server's response
 	reader := &buf.BufferedReader{Reader: m.link.Reader}
 	var responseMeta FrameMetadata
 	if err := responseMeta.Unmarshal(reader); err != nil {
 		return newError("failed to read negotiation response metadata").Base(err)
 	}
 
-	// 检查响应帧的 ID 和状态
+	// Check response frame ID and status
 	if responseMeta.SessionID != 0 || responseMeta.SessionStatus != SessionStatusNegotiateVersion {
 		return newError("invalid negotiation response frame: ID=", responseMeta.SessionID, " Status=", responseMeta.SessionStatus)
 	}
 
-	// 检查响应帧是否包含 Extra Data
+	// Check if response frame contains Extra Data
 	if !responseMeta.Option.Has(OptionData) {
 		return newError("negotiation response has no data")
 	}
 
-	// 读取服务器响应的 Extra Data
+	// Read server response Extra Data
 	dataLen, err := serial.ReadUint16(reader)
 	if err != nil {
 		return newError("failed to read negotiation response data length").Base(err)
 	}
-	if dataLen != 5 { // 1 字节数量 + 4 字节版本号
+	if dataLen != 5 { // 1 byte count + 4 bytes version number
 		return newError("invalid negotiation response data length: ", dataLen)
 	}
 
@@ -294,16 +294,16 @@ func (m *ClientWorker) NegotiateAndStart() error {
 	}
 
 	count := responsePayload.Byte(0)
-	if count != 1 { // 服务器响应的版本数量必须为 1
+	if count != 1 { // Server response version count must be 1
 		return newError("invalid version count in negotiation response: ", count)
 	}
 
 	negotiatedVersion := binary.BigEndian.Uint32(responsePayload.BytesRange(1, 5))
-	if negotiatedVersion != Version { // 检查协商版本是否是客户端支持的版本
+	if negotiatedVersion != Version { // Check if negotiated version is supported by client
 		return newError("server selected an unsupported version: ", negotiatedVersion)
 	}
 
-	// 3. 协商成功，标记并启动主循环
+	// 3. Negotiation successful, mark and start main loop
 	m.negotiated = true
 	newError("Mux.Pro negotiation succeeded, version ", negotiatedVersion).WriteToLog()
 	m.start()
@@ -311,43 +311,43 @@ func (m *ClientWorker) NegotiateAndStart() error {
 	return nil
 }
 
-// TotalConnections 返回总连接数（包括已关闭的）。
+// TotalConnections returns the total number of connections (including closed ones).
 func (m *ClientWorker) TotalConnections() uint32 {
 	return uint32(m.sessionManager.Count())
 }
 
-// ActiveConnections 返回活跃连接数。
+// ActiveConnections returns the number of active connections.
 func (m *ClientWorker) ActiveConnections() uint32 {
 	return uint32(m.sessionManager.Size())
 }
 
-// Closed 检查工作器是否已关闭。
+// Closed checks if the worker is closed.
 func (m *ClientWorker) Closed() bool {
 	return m.done.Done()
 }
 
-// monitor 监控会话状态，并在没有活跃会话时关闭工作器。
+// monitor monitors session status and closes the worker if no active sessions.
 func (m *ClientWorker) monitor() {
-	timer := time.NewTicker(time.Second * 16) // 每 16 秒检查一次
+	timer := time.NewTicker(time.Second * 16) // Check every 16 seconds
 	defer timer.Stop()
 
 	for {
 		select {
-		case <-m.done.Wait(): // 工作器关闭信号
+		case <-m.done.Wait(): // Worker close signal
 			m.sessionManager.Close()
 			common.Close(m.link.Writer)
 			common.Interrupt(m.link.Reader)
 			return
-		case <-timer.C: // 定时器触发
+		case <-timer.C: // Timer triggered
 			size := m.sessionManager.Size()
-			if size == 0 && m.sessionManager.CloseIfNoSession() { // 如果没有活跃会话，尝试关闭工作器
+			if size == 0 && m.sessionManager.CloseIfNoSession() { // If no active sessions, try to close worker
 				common.Must(m.done.Close())
 			}
 		}
 	}
 }
 
-// writeFirstPayload 写入第一个负载。
+// writeFirstPayload writes the first payload.
 func writeFirstPayload(reader buf.Reader, writer *Writer) error {
 	err := buf.CopyOnceTimeout(reader, writer, time.Millisecond*100)
 	if err == buf.ErrNotTimeoutReader || err == buf.ErrReadTimeout {
@@ -361,7 +361,7 @@ func writeFirstPayload(reader buf.Reader, writer *Writer) error {
 	return nil
 }
 
-// fetchInput 从会话输入流读取数据并写入 Mux 帧。
+// fetchInput reads data from session input stream and writes to Mux frames.
 func fetchInput(ctx context.Context, s *Session, output buf.Writer) {
 	dest := session.OutboundFromContext(ctx).Target
 	transferType := protocol.TransferTypeStream
@@ -369,7 +369,7 @@ func fetchInput(ctx context.Context, s *Session, output buf.Writer) {
 		transferType = protocol.TransferTypePacket
 	}
 	s.transferType = transferType
-	// Mux.Pro: 传递优先级，默认为 0x00 (最高优先级)
+	// Mux.Pro: Pass priority, default to 0x00 (highest priority)
 	writer := NewWriter(s.ID, dest, output, transferType, 0x00, s)
 	defer s.Close()
 	defer writer.Close()
@@ -392,7 +392,7 @@ func fetchInput(ctx context.Context, s *Session, output buf.Writer) {
 	}
 }
 
-// IsClosing 检查工作器是否正在关闭。
+// IsClosing checks if the worker is closing.
 func (m *ClientWorker) IsClosing() bool {
 	sm := m.sessionManager
 	if m.strategy.MaxConnection > 0 && sm.Count() >= int(m.strategy.MaxConnection) {
@@ -401,7 +401,7 @@ func (m *ClientWorker) IsClosing() bool {
 	return false
 }
 
-// IsFull 检查工作器是否已满。
+// IsFull checks if the worker is full.
 func (m *ClientWorker) IsFull() bool {
 	if m.IsClosing() || m.Closed() {
 		return true
@@ -414,14 +414,14 @@ func (m *ClientWorker) IsFull() bool {
 	return false
 }
 
-// Dispatch 将新的链接分派给工作器。
+// Dispatch dispatches a new link to the worker.
 func (m *ClientWorker) Dispatch(ctx context.Context, link *transport.Link) bool {
 	if m.IsFull() || m.Closed() {
 		return false
 	}
 
 	sm := m.sessionManager
-	s := sm.Allocate() // Allocate 会创建并初始化 Session，包括流控字段
+	s := sm.Allocate() // Allocate creates and initializes Session, including flow control fields
 	if s == nil {
 		return false
 	}
@@ -431,25 +431,25 @@ func (m *ClientWorker) Dispatch(ctx context.Context, link *transport.Link) bool 
 	return true
 }
 
-// handleStatueKeepAlive 处理 KeepAlive 帧。
+// handleStatueKeepAlive handles KeepAlive frames.
 func (m *ClientWorker) handleStatueKeepAlive(meta *FrameMetadata, reader *buf.BufferedReader) error {
-	// Mux.Pro: KeepAlive 帧的 Opt 必须为 0x00，且不带数据。
+	// Mux.Pro: KeepAlive frame's Opt must be 0x00 and carry no data.
 	if meta.Option != 0 {
 		return newError("protocol error: KeepAlive frame with non-zero option: ", meta.Option)
 	}
 	return nil
 }
 
-// handleStatusNew 处理 New 帧（客户端不应收到）。
+// handleStatusNew handles New frames (client should not receive).
 func (m *ClientWorker) handleStatusNew(meta *FrameMetadata, reader *buf.BufferedReader) error {
-	// 客户端不应该收到 New 帧。如果收到，视为协议错误并丢弃数据。
+	// Client should not receive New frames. If received, treat as protocol error and discard data.
 	if meta.Option.Has(OptionData) {
 		return buf.Copy(NewStreamReader(reader), buf.Discard)
 	}
 	return nil
 }
 
-// handleCreditUpdate 处理 CreditUpdate 帧。
+// handleCreditUpdate handles CreditUpdate frames.
 func (m *ClientWorker) handleCreditUpdate(meta *FrameMetadata, reader *buf.BufferedReader) error {
 	if !meta.Option.Has(OptionData) {
 		return newError("CreditUpdate frame has no data")
@@ -457,15 +457,15 @@ func (m *ClientWorker) handleCreditUpdate(meta *FrameMetadata, reader *buf.Buffe
 
 	s, found := m.sessionManager.Get(meta.SessionID)
 	if !found {
-		return buf.Copy(NewStreamReader(reader), buf.Discard) // 丢弃未知会话的信用更新
+		return buf.Copy(NewStreamReader(reader), buf.Discard) // Discard credit update for unknown session
 	}
 
-	// 读取 Credit Increment (Extra Data)
+	// Read Credit Increment (Extra Data)
 	dataLen, err := serial.ReadUint16(reader)
 	if err != nil {
 		return newError("failed to read CreditUpdate data length").Base(err)
 	}
-	if dataLen != 4 { // Mux.Pro 规范中 Credit Increment 是 4 字节 (uint32)
+	if dataLen != 4 { // Mux.Pro spec states Credit Increment is 4 bytes (uint32)
 		return newError("invalid CreditUpdate data length: ", dataLen)
 	}
 
@@ -476,14 +476,14 @@ func (m *ClientWorker) handleCreditUpdate(meta *FrameMetadata, reader *buf.Buffe
 	}
 
 	increment := binary.BigEndian.Uint32(payload.Bytes())
-	s.GrantCredit(increment) // 增加会话的发送信用
+	s.GrantCredit(increment) // Increase session's send credit
 
 	newError("session ", s.ID, " granted credit: ", increment).WriteToLog()
 	return nil
 }
 
 
-// handleStatusKeep 处理 Keep 帧（数据传输）。
+// handleStatusKeep handles Keep frames (data transfer).
 func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.BufferedReader) error {
 	if !meta.Option.Has(OptionData) {
 		return nil
@@ -491,61 +491,64 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 
 	s, found := m.sessionManager.Get(meta.SessionID)
 	if !found {
-		closingWriter := NewResponseWriter(meta.SessionID, m.link.Writer, protocol.TransferTypeStream, nil) // 对于未知会话，session 可以为 nil
+		closingWriter := NewResponseWriter(meta.SessionID, m.link.Writer, protocol.TransferTypeStream, nil) // For unknown sessions, session can be nil
 		closingWriter.SetErrorCode(ErrorCodeProtocolError)
 		closingWriter.Close()
 		return buf.Copy(NewStreamReader(reader), buf.Discard)
 	}
 
 	rr := s.NewReader(reader)
-	copiedBytes, err := buf.Copy(rr, s.output) // 将数据从 Mux Reader 复制到会话输出流
+	var sc buf.SizeCounter // Declare a buf.SizeCounter instance
+	err := buf.Copy(rr, s.output, buf.CountSize(&sc)) // Call buf.Copy and pass CountSize option
+	copiedBytes := sc.Size // Get copied bytes from SizeCounter
+
 	if err != nil && buf.IsWriteError(err) {
 		newError("failed to write to downstream. closing session ", s.ID).Base(err).WriteToLog()
 		closingWriter := NewResponseWriter(meta.SessionID, m.link.Writer, protocol.TransferTypeStream, s)
 		closingWriter.SetErrorCode(ErrorCodeProtocolError)
 		closingWriter.Close()
-		drainErr := buf.Copy(rr, buf.Discard) // 丢弃剩余数据
+		drainErr := buf.Copy(rr, buf.Discard) // Discard remaining data
 		common.Interrupt(s.input)
 		s.Close()
 		return drainErr
 	}
 
-	// Mux.Pro: 接收方逻辑 - 发送 CreditUpdate 帧
+	// Mux.Pro: Receiver logic - send CreditUpdate frame
 	s.AddReceivedBytes(uint32(copiedBytes))
 	if s.GetReceivedBytes() >= CreditUpdateThreshold {
 		newError("sending credit update for session ", s.ID, ", increment: ", DefaultInitialCredit).WriteToLog()
-		// 构造 CreditUpdate 帧
+		// Construct CreditUpdate frame
 		creditMeta := FrameMetadata{
 			SessionID:     s.ID,
 			SessionStatus: SessionStatusCreditUpdate,
-			Option:        OptionData, // 必须设置 OptionData，因为信用增量是 Extra Data
+			Option:        OptionData, // OptionData must be set as credit increment is Extra Data
 		}
 		creditFrame := buf.New()
 		common.Must(creditMeta.WriteTo(creditFrame))
 
-		// 构造 Extra Data: 4字节信用增量
+		// Construct Extra Data: 4-byte credit increment
 		creditPayload := buf.New()
-		common.Must(WriteUint32(creditPayload, DefaultInitialCredit)) // 增加 DefaultInitialCredit 信用
+		common.Must(WriteUint32(creditPayload, DefaultInitialCredit)) // Add DefaultInitialCredit credit
 		defer creditPayload.Release()
 
-		Must2(serial.WriteUint16(creditFrame, uint16(creditPayload.Len())))
-		Must2(creditFrame.Write(creditPayload.Bytes()))
+		common.Must(serial.WriteUint16(creditFrame, uint16(creditPayload.Len())))
+		common.Must(creditFrame.Write(creditPayload.Bytes()))
 
-		// 尝试发送 CreditUpdate 帧
+		// Attempt to send CreditUpdate frame
 		if writeErr := m.link.Writer.WriteMultiBuffer(buf.MultiBuffer{creditFrame}); writeErr != nil {
 			newError("failed to send CreditUpdate frame for session ", s.ID).Base(writeErr).WriteToLog()
 		} else {
-			s.ResetReceivedBytes() // 成功发送后重置计数
+			s.ResetReceivedBytes() // Reset count after successful send
 		}
 	}
 
 	return err
 }
 
-// handleStatusEnd 处理 End 帧（关闭子连接）。
+// handleStatusEnd handles End frames (closing sub-connection).
 func (m *ClientWorker) handleStatusEnd(meta *FrameMetadata, reader *buf.BufferedReader) error {
 	if s, found := m.sessionManager.Get(meta.SessionID); found {
-		// Mux.Pro: 使用 ErrorCode 而不是 OptionError 来判断关闭原因。
+		// Mux.Pro: Use ErrorCode instead of OptionError to determine close reason.
 		if meta.ErrorCode != ErrorCodeGracefulShutdown {
 			newError("session ", s.ID, " ended with error code: ", meta.ErrorCode).WriteToLog()
 			common.Interrupt(s.input)
@@ -553,15 +556,15 @@ func (m *ClientWorker) handleStatusEnd(meta *FrameMetadata, reader *buf.Buffered
 		}
 		s.Close()
 	}
-	if meta.Option.Has(OptionData) { // 如果 End 帧意外地包含数据，丢弃它
+	if meta.Option.Has(OptionData) { // If End frame unexpectedly contains data, discard it
 		return buf.Copy(NewStreamReader(reader), buf.Discard)
 	}
 	return nil
 }
 
-// fetchOutput 从 Mux 主连接读取并处理入站帧。
+// fetchOutput reads and processes inbound Mux frames from the main connection.
 func (m *ClientWorker) fetchOutput() {
-	// 确保在协商完成后才开始处理输出。
+	// Ensure output processing starts only after negotiation is complete.
 	if !m.negotiated {
 		newError("fetchOutput started before negotiation").AtError().WriteToLog()
 		common.Must(m.done.Close())
@@ -576,7 +579,7 @@ func (m *ClientWorker) fetchOutput() {
 
 	var meta FrameMetadata
 	for {
-		err := meta.Unmarshal(reader) // 解析帧元数据
+		err := meta.Unmarshal(reader) // Parse frame metadata
 		if err != nil {
 			if errors.Cause(err) != io.EOF {
 				newError("failed to read metadata").Base(err).WriteToLog()
@@ -593,10 +596,10 @@ func (m *ClientWorker) fetchOutput() {
 			err = m.handleStatusNew(&meta, reader)
 		case SessionStatusKeep:
 			err = m.handleStatusKeep(&meta, reader)
-		case SessionStatusCreditUpdate: // Mux.Pro: 处理信用更新帧
+		case SessionStatusCreditUpdate: // Mux.Pro: Handle CreditUpdate frame
 			err = m.handleCreditUpdate(&meta, reader)
 		case SessionStatusNegotiateVersion:
-			// 协商后不应再收到此帧，视为协议错误
+			// This frame should not be received after negotiation, treat as protocol error
 			err = newError("unexpected NegotiateVersion frame after initial negotiation")
 		default:
 			status := meta.SessionStatus
@@ -610,3 +613,4 @@ func (m *ClientWorker) fetchOutput() {
 		}
 	}
 }
+
