@@ -11,13 +11,13 @@ import (
 type SessionManager struct {
 	sync.RWMutex
 	sessions map[uint16]*Session
-	count    uint16
+	count    uint16 // Next available session ID
 	closed   bool
 }
 
 func NewSessionManager() *SessionManager {
 	return &SessionManager{
-		count:    0,
+		count:    0, // Will be incremented to 1 for the first session
 		sessions: make(map[uint16]*Session, 16),
 	}
 }
@@ -43,6 +43,9 @@ func (m *SessionManager) Count() int {
 	return int(m.count)
 }
 
+// Allocate allocates a new Session ID and creates a Session.
+// Mux.Pro IDs are 2-byte unsigned integers, 0x0000 is reserved for Main Connection Control.
+// So, IDs for sub-connections should start from 0x0001.
 func (m *SessionManager) Allocate() *Session {
 	m.Lock()
 	defer m.Unlock()
@@ -51,10 +54,28 @@ func (m *SessionManager) Allocate() *Session {
 		return nil
 	}
 
-	m.count++
+	// Find the next available ID that is not 0x0000
+	for {
+		m.count++ // Increment to get a new ID
+		if m.count == 0 { // Skip 0x0000 as it's reserved for Main Connection Control
+			m.count++
+		}
+		if _, exists := m.sessions[m.count]; !exists {
+			break // Found an unused ID
+		}
+		if m.count == 0xFFFF { // If wrapped around, and 0xFFFF is also used, try to find one
+			// This scenario is highly unlikely for 65534 concurrent sessions.
+			// For simplicity, we just return nil, indicating no more IDs.
+			// In a real-world scenario, you might want to log a warning or
+			// implement more sophisticated ID recycling/management.
+			return nil
+		}
+	}
+
 	s := &Session{
 		ID:     m.count,
 		parent: m,
+		credit: initialSessionCredit, // Mux.Pro: Initialize session credit
 	}
 	m.sessions[s.ID] = s
 	return s
@@ -67,8 +88,6 @@ func (m *SessionManager) Add(s *Session) {
 	if m.closed {
 		return
 	}
-
-	m.count++
 	m.sessions[s.ID] = s
 }
 
@@ -141,20 +160,60 @@ type Session struct {
 	parent       *SessionManager
 	ID           uint16
 	transferType protocol.TransferType
+
+	// Mux.Pro Extension: Flow control credit
+	creditMtx sync.Mutex
+	credit    uint32
 }
 
-// Close closes all resources associated with this session.
+// Default initial credit for a new session.
+// This value can be tuned based on network conditions and desired throughput.
+const initialSessionCredit uint32 = 64 * 1024 // 64KB initial credit
+
+// AddCredit adds credit to the session.
+func (s *Session) AddCredit(amount uint32) {
+	s.creditMtx.Lock()
+	defer s.creditMtx.Unlock()
+	s.credit += amount
+}
+
+// ConsumeCredit attempts to consume credit from the session.
+// Returns true if enough credit is available and consumed, false otherwise.
+func (s *Session) ConsumeCredit(amount uint32) bool {
+	s.creditMtx.Lock()
+	defer s.creditMtx.Unlock()
+	if s.credit >= amount {
+		s.credit -= amount
+		return true
+	}
+	return false
+}
+
+// HasCredit checks if the session has at least the specified amount of credit.
+func (s *Session) HasCredit(amount uint32) bool {
+	s.creditMtx.Lock()
+	defer s.creditMtx.Unlock()
+	return s.credit >= amount
+}
+
+// GetCredit returns the current credit amount for the session.
+func (s *Session) GetCredit() uint32 {
+	s.creditMtx.Lock()
+	defer s.creditMtx.Unlock()
+	return s.credit
+}
+
+// Close closes the session.
 func (s *Session) Close() error {
-	common.Close(s.output)
 	common.Close(s.input)
+	common.Close(s.output)
 	s.parent.Remove(s.ID)
 	return nil
 }
 
-// NewReader creates a buf.Reader based on the transfer type of this Session.
 func (s *Session) NewReader(reader *buf.BufferedReader) buf.Reader {
 	if s.transferType == protocol.TransferTypeStream {
-		return NewStreamReader(reader)
+		return crypto.NewChunkStreamReaderWithChunkCount(reader)
 	}
 	return NewPacketReader(reader)
 }
