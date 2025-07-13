@@ -106,6 +106,30 @@ func (w *Writer) getNextFrameMeta() FrameMetadata {
 	return meta
 }
 
+// writeMetaWithFrame writes metadata and a payload (Extra Data or actual data).
+// writer: The underlying buf.Writer.
+// meta: The FrameMetadata to be written.
+// payload: The actual data payload (can be Extra Data or application data).
+func writeMetaWithFrame(writer buf.Writer, meta FrameMetadata, payload buf.MultiBuffer) error {
+	frame := buf.New()
+	if err := meta.WriteTo(frame); err != nil {
+		return err
+	}
+
+	// Write payload length and content
+	// Mux.Pro: This handles both Extra Data and actual data payload.
+	Must2(serial.WriteUint16(frame, uint16(payload.Len())))
+	// Fix: Use buf.Copy(payload, frame) to write MultiBuffer content to a single Buffer.
+	// Or, more efficiently, append individual buffers.
+	// Since frame is a single buf.Buffer, and payload is MultiBuffer, we need to copy.
+	if _, err := buf.Copy(payload, buf.NewBufferedWriter(frame)); err != nil {
+		frame.Release()
+		return newError("failed to copy payload to frame buffer").Base(err)
+	}
+
+	return writer.WriteMultiBuffer(buf.MultiBuffer{frame})
+}
+
 // writeDataInternal is an internal function that actually writes data frames, without flow control logic.
 // It constructs the full Extra Data payload including any UDP specific prefixes.
 // packetDest: For UDP packets, this is the associated net.Destination (e.g., source for responses, target for requests).
@@ -150,12 +174,20 @@ func (w *Writer) writeDataInternal(dataMB buf.MultiBuffer, packetDest *net.Desti
 	// Write Extra Data length and content if present
 	if !extraDataPayload.IsEmpty() {
 		Must2(serial.WriteUint16(frame, uint16(extraDataPayload.Len())))
-		Must2(frame.Write(extraDataPayload.Bytes()))
+		// Fix: Use buf.Copy to write MultiBuffer content to a single Buffer.
+		if _, err := buf.Copy(extraDataPayload, buf.NewBufferedWriter(frame)); err != nil {
+			frame.Release()
+			return newError("failed to copy extra data payload to frame buffer").Base(err)
+		}
 	}
 
 	// Write actual data payload length and content
 	Must2(serial.WriteUint16(frame, uint16(dataMB.Len())))
-	Must2(frame.Write(dataMB.Bytes()))
+	// Fix: Use buf.Copy to write MultiBuffer content to a single Buffer.
+	if _, err := buf.Copy(dataMB, buf.NewBufferedWriter(frame)); err != nil {
+		frame.Release()
+		return newError("failed to copy data payload to frame buffer").Base(err)
+	}
 
 	return w.writer.WriteMultiBuffer(buf.MultiBuffer{frame})
 }
@@ -169,7 +201,13 @@ func (w *Writer) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		// If no data, but it's the first frame for a new session (client side), send a New frame without data.
 		// For Keep frames (followup is true), an empty MultiBuffer means no data to send, so just return.
 		if !w.followup {
-			return w.writeMetaOnly()
+			meta := w.getNextFrameMeta()
+			// No OptionData for meta-only frame
+			frame := buf.New()
+			common.Must(meta.WriteTo(frame))
+			// Write 0 length for payload
+			Must2(serial.WriteUint16(frame, 0))
+			return w.writer.WriteMultiBuffer(buf.MultiBuffer{frame})
 		}
 		return nil
 	}
