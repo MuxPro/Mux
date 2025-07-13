@@ -88,11 +88,12 @@ func readUDPMetaData(reader *buf.BufferedReader) (net.Destination, GlobalID, err
 		return net.Destination{}, GlobalID{}, newError("insufficient data for UDP metadata: payload too short").AtWarning()
 	}
 
-	addrType := payload.Byte(0)
+	addrTypeByte := payload.Byte(0)
 	payload.Advance(1) // Consume address type byte
 
 	var addr net.Address
-	switch addrType {
+	// Fix: Cast addrTypeByte to protocol.AddressType for switch comparison
+	switch protocol.AddressType(addrTypeByte) {
 	case protocol.AddressTypeIPv4:
 		if payload.Len() < 4 {
 			return net.Destination{}, GlobalID{}, newError("insufficient data for IPv4 address").AtWarning()
@@ -109,15 +110,16 @@ func readUDPMetaData(reader *buf.BufferedReader) (net.Destination, GlobalID, err
 		if payload.Len() < 1 {
 			return net.Destination{}, GlobalID{}, newError("insufficient data for domain length").AtWarning()
 		}
-		domainLen := payload.Byte(0)
+		domainLen := payload.Byte(0) // domainLen is byte
 		payload.Advance(1) // Consume domain length byte
-		if payload.Len() < int(domainLen) {
+		// Fix: Cast domainLen to int32 for comparison and arguments
+		if payload.Len() < int32(domainLen) {
 			return net.Destination{}, GlobalID{}, newError("insufficient data for domain").AtWarning()
 		}
-		addr = net.DomainAddress(string(payload.BytesTo(int(domainLen))))
-		payload.Advance(int(domainLen))
+		addr = net.DomainAddress(string(payload.BytesTo(int32(domainLen))))
+		payload.Advance(int32(domainLen))
 	default:
-		return net.Destination{}, GlobalID{}, newError("unknown address type in UDP metadata: ", addrType).AtWarning()
+		return net.Destination{}, GlobalID{}, newError("unknown address type in UDP metadata: ", addrTypeByte).AtWarning()
 	}
 
 	if payload.Len() < 2 {
