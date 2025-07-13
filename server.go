@@ -90,7 +90,8 @@ func NewServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.
 
 // handle handles data forwarding for sub-connections.
 func handle(ctx context.Context, s *Session, output buf.Writer) {
-	writer := NewResponseWriter(s.ID, output, s.transferType, s)
+	// Pass a zero GlobalID for now; actual GlobalID will be extracted from New frame in future stages
+	writer := NewResponseWriter(s.ID, output, s.transferType, s, GlobalID{})
 	if err := buf.Copy(s.input, writer); err != nil { // buf.Copy returns only error
 		newError("session ", s.ID, " ends.").Base(err).WriteToLog(session.ExportIDToError(ctx))
 		writer.SetErrorCode(ErrorCodeProtocolError)
@@ -307,7 +308,8 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 
 	s, found := w.sessionManager.Get(meta.SessionID)
 	if !found {
-		closingWriter := NewResponseWriter(meta.SessionID, w.link.Writer, protocol.TransferTypeStream, nil) // For unknown sessions, session can be nil
+		// Pass a zero GlobalID for now; actual GlobalID will be extracted from Keep frame in future stages
+		closingWriter := NewResponseWriter(meta.SessionID, w.link.Writer, protocol.TransferTypeStream, nil, GlobalID{}) 
 		closingWriter.SetErrorCode(ErrorCodeProtocolError)
 		closingWriter.Close()
 		return buf.Copy(NewStreamReader(reader), buf.Discard)
@@ -320,7 +322,8 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 
 	if err != nil && buf.IsWriteError(err) {
 		newError("failed to write to downstream writer. closing session ", s.ID).Base(err).WriteToLog()
-		closingWriter := NewResponseWriter(meta.SessionID, w.link.Writer, protocol.TransferTypeStream, s)
+		// Pass a zero GlobalID for now
+		closingWriter := NewResponseWriter(meta.SessionID, w.link.Writer, protocol.TransferTypeStream, s, GlobalID{})
 		closingWriter.SetErrorCode(ErrorCodeProtocolError)
 		closingWriter.Close()
 		drainErr := buf.Copy(rr, buf.Discard) // Discard remaining data
@@ -441,4 +444,3 @@ func (w *ServerWorker) run(ctx context.Context) {
 		}
 	}
 }
-
