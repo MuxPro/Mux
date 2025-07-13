@@ -18,6 +18,11 @@ const (
 	CreditUpdateThreshold uint32 = 32 * 1024 // 32KB
 )
 
+// GlobalID is an 8-byte identifier for UDP FullCone NAT sessions.
+// This type is defined in frame.go. It's included here for clarity if this file is viewed in isolation.
+// For a production build, ensure it's consistently defined in frame.go.
+// type GlobalID [8]byte // Commented out as it's defined in frame.go
+
 // SessionManager manages all sub-connections within a Mux main connection.
 type SessionManager struct {
 	sync.RWMutex
@@ -74,12 +79,12 @@ func (m *SessionManager) Allocate() *Session {
 		}
 		if _, found := m.sessions[m.count]; !found {
 			s := &Session{
-				ID:           m.count,
-				parent:       m,
-				sendCredit:   DefaultInitialCredit,      // Mux.Pro: Initialize sending credit to default
-				creditUpdate: make(chan struct{}, 1),    // Mux.Pro: Initialize credit update notification channel
-				receivedBytes: 0,                        // Mux.Pro: Initialize received bytes counter
-				done:         done.New(),                // Initialize done instance for the session
+				ID:            m.count,
+				parent:        m,
+				sendCredit:    DefaultInitialCredit,    // Mux.Pro: Initialize sending credit to default
+				creditUpdate:  make(chan struct{}, 1),  // Mux.Pro: Initialize credit update notification channel
+				receivedBytes: 0,                       // Mux.Pro: Initialize received bytes counter
+				done:          done.New(),              // Initialize done instance for the session
 			}
 			m.sessions[s.ID] = s
 			return s
@@ -236,7 +241,7 @@ func (s *Session) Close() error {
 }
 
 // NewReader creates a buf.Reader based on the transfer type of this Session.
-// Note: NewStreamReader and NewPacketReader are assumed to be defined elsewhere in the mux package.
+// NewStreamReader and NewPacketReader are now defined in reader.go.
 func (s *Session) NewReader(reader *buf.BufferedReader) buf.Reader {
 	if s.transferType == protocol.TransferTypeStream {
 		return NewStreamReader(reader)
