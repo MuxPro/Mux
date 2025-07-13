@@ -2,6 +2,7 @@ package mux
 
 import (
 	"context"
+	"encoding/binary"
 	"io"
 	"sync"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/v2fly/v2ray-core/v5/common/errors"
 	"github.com/v2fly/v2ray-core/v5/common/net"
 	"github.com/v2fly/v2ray-core/v5/common/protocol"
+	"github.com/v2fly/v2ray-core/v5/common/serial"
 	"github.com/v2fly/v2ray-core/v5/common/session"
 	"github.com/v2fly/v2ray-core/v5/common/signal/done"
 	"github.com/v2fly/v2ray-core/v5/common/task"
@@ -144,6 +146,12 @@ func NewDialingWorkerFactory(ctx context.Context, proxy proxy.Outbound, dialer i
 	}
 }
 
+var (
+	// muxProAddress 是 Mux.Pro 连接的目标地址。
+	muxProAddress = net.DomainAddress("mux.pro")
+	muxProPort    = net.Port(9527)
+)
+
 func (f *DialingWorkerFactory) Create() (*ClientWorker, error) {
 	opts := []pipe.Option{pipe.WithSizeLimit(64 * 1024)}
 	uplinkReader, upLinkWriter := pipe.New(opts...)
@@ -157,18 +165,25 @@ func (f *DialingWorkerFactory) Create() (*ClientWorker, error) {
 		return nil, err
 	}
 
+	// 启动一个 goroutine 来处理底层连接的建立和数据转发。
 	go func(p proxy.Outbound, d internet.Dialer, c common.Closable) {
 		ctx := session.ContextWithOutbound(f.ctx, &session.Outbound{
-			Target: net.TCPDestination(muxCoolAddress, muxCoolPort),
+			Target: net.TCPDestination(muxProAddress, muxProPort),
 		})
 		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		defer common.Must(c.Close())
 
 		if err := p.Process(ctx, &transport.Link{Reader: uplinkReader, Writer: downlinkWriter}, d); err != nil {
-			errors.New("failed to handler mux client connection").Base(err).WriteToLog()
+			newError("failed to handle mux client connection").Base(err).WriteToLog()
 		}
-		common.Must(c.Close())
-		cancel()
 	}(f.Proxy, f.Dialer, c.done)
+
+	// 阻塞地执行版本协商，协商成功后启动 worker 的主循环。
+	if err := c.NegotiateAndStart(); err != nil {
+		c.done.Close() // 确保在协商失败时关闭 worker
+		return nil, newError("Mux.Pro negotiation failed").Base(err)
+	}
 
 	return c, nil
 }
@@ -183,14 +198,10 @@ type ClientWorker struct {
 	link           transport.Link
 	done           *done.Instance
 	strategy       ClientStrategy
+	negotiated     bool // Mux.Pro: 标记是否已完成版本协商
 }
 
-var (
-	muxCoolAddress = net.DomainAddress("v1.mux.cool")
-	muxCoolPort    = net.Port(9527)
-)
-
-// NewClientWorker creates a new mux.Client.
+// NewClientWorker 创建一个新的 mux.ClientWorker。
 func NewClientWorker(stream transport.Link, s ClientStrategy) (*ClientWorker, error) {
 	c := &ClientWorker{
 		sessionManager: NewSessionManager(),
@@ -198,11 +209,87 @@ func NewClientWorker(stream transport.Link, s ClientStrategy) (*ClientWorker, er
 		done:           done.New(),
 		strategy:       s,
 	}
-
-	go c.fetchOutput()
-	go c.monitor()
-
 	return c, nil
+}
+
+// start 启动 worker 的主处理循环。
+func (m *ClientWorker) start() {
+	go m.fetchOutput()
+	go m.monitor()
+}
+
+// NegotiateAndStart 执行 Mux.Pro 版本协商，成功后启动 worker。
+func (m *ClientWorker) NegotiateAndStart() error {
+	// 1. 发送客户端支持的版本列表
+	meta := FrameMetadata{
+		SessionID:     0, // 版本协商使用主连接 ID 0
+		SessionStatus: SessionStatusNegotiateVersion,
+		Option:        OptionData,
+	}
+
+	frame := buf.New()
+	common.Must(meta.WriteTo(frame))
+
+	// 构造版本协商的 Extra Data
+	versionsPayload := buf.New()
+	common.Must(versionsPayload.WriteByte(1))                 // 版本数量 N = 1
+	common.Must(serial.WriteUint32(versionsPayload, Version)) // 版本号
+	defer versionsPayload.Release()
+
+	// 写入 Extra Data 的长度和内容
+	common.Must(serial.WriteUint16(frame, uint16(versionsPayload.Len())))
+	frame.WriteAll(versionsPayload.Bytes())
+
+	if err := m.link.Writer.WriteMultiBuffer(buf.MultiBuffer{frame}); err != nil {
+		return newError("failed to write negotiation request").Base(err)
+	}
+
+	// 2. 读取并解析服务器的响应
+	reader := &buf.BufferedReader{Reader: m.link.Reader}
+	var responseMeta FrameMetadata
+	if err := responseMeta.Unmarshal(reader); err != nil {
+		return newError("failed to read negotiation response metadata").Base(err)
+	}
+
+	if responseMeta.SessionID != 0 || responseMeta.SessionStatus != SessionStatusNegotiateVersion {
+		return newError("invalid negotiation response frame: ID=", responseMeta.SessionID, " Status=", responseMeta.SessionStatus)
+	}
+
+	if !responseMeta.Option.Has(OptionData) {
+		return newError("negotiation response has no data")
+	}
+
+	// 读取服务器响应的 Extra Data
+	dataLen, err := serial.ReadUint16(reader)
+	if err != nil {
+		return newError("failed to read negotiation response data length").Base(err)
+	}
+	if dataLen != 5 { // 1 字节数量 + 4 字节版本号
+		return newError("invalid negotiation response data length: ", dataLen)
+	}
+
+	responsePayload := buf.New()
+	defer responsePayload.Release()
+	if _, err := responsePayload.ReadFullFrom(reader, int32(dataLen)); err != nil {
+		return err
+	}
+
+	count := responsePayload.Byte(0)
+	if count != 1 {
+		return newError("invalid version count in negotiation response: ", count)
+	}
+
+	negotiatedVersion := binary.BigEndian.Uint32(responsePayload.BytesRange(1, 5))
+	if negotiatedVersion != Version {
+		return newError("server selected an unsupported version: ", negotiatedVersion)
+	}
+
+	// 3. 协商成功，标记并启动主循环
+	m.negotiated = true
+	newError("Mux.Pro negotiation succeeded, version ", negotiatedVersion).WriteToLog()
+	m.start()
+
+	return nil
 }
 
 func (m *ClientWorker) TotalConnections() uint32 {
@@ -213,7 +300,6 @@ func (m *ClientWorker) ActiveConnections() uint32 {
 	return uint32(m.sessionManager.Size())
 }
 
-// Closed returns true if this Client is closed.
 func (m *ClientWorker) Closed() bool {
 	return m.done.Done()
 }
@@ -315,13 +401,15 @@ func (m *ClientWorker) Dispatch(ctx context.Context, link *transport.Link) bool 
 }
 
 func (m *ClientWorker) handleStatueKeepAlive(meta *FrameMetadata, reader *buf.BufferedReader) error {
-	if meta.Option.Has(OptionData) {
-		return buf.Copy(NewStreamReader(reader), buf.Discard)
+	// Mux.Pro: KeepAlive 帧的 Opt 必须为 0x00，且不带数据。
+	if meta.Option != 0 {
+		return newError("protocol error: KeepAlive frame with non-zero option: ", meta.Option)
 	}
 	return nil
 }
 
 func (m *ClientWorker) handleStatusNew(meta *FrameMetadata, reader *buf.BufferedReader) error {
+	// 客户端不应该收到 New 帧。
 	if meta.Option.Has(OptionData) {
 		return buf.Copy(NewStreamReader(reader), buf.Discard)
 	}
@@ -335,10 +423,8 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 
 	s, found := m.sessionManager.Get(meta.SessionID)
 	if !found {
-		// Notify remote peer to close this session.
 		closingWriter := NewResponseWriter(meta.SessionID, m.link.Writer, protocol.TransferTypeStream)
 		closingWriter.Close()
-
 		return buf.Copy(NewStreamReader(reader), buf.Discard)
 	}
 
@@ -346,23 +432,21 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	err := buf.Copy(rr, s.output)
 	if err != nil && buf.IsWriteError(err) {
 		newError("failed to write to downstream. closing session ", s.ID).Base(err).WriteToLog()
-
-		// Notify remote peer to close this session.
 		closingWriter := NewResponseWriter(meta.SessionID, m.link.Writer, protocol.TransferTypeStream)
 		closingWriter.Close()
-
 		drainErr := buf.Copy(rr, buf.Discard)
 		common.Interrupt(s.input)
 		s.Close()
 		return drainErr
 	}
-
 	return err
 }
 
 func (m *ClientWorker) handleStatusEnd(meta *FrameMetadata, reader *buf.BufferedReader) error {
 	if s, found := m.sessionManager.Get(meta.SessionID); found {
-		if meta.Option.Has(OptionError) {
+		// Mux.Pro: 使用 ErrorCode 而不是 OptionError 来判断关闭原因。
+		if meta.ErrorCode != ErrorCodeGracefulShutdown {
+			newError("session ", s.ID, " ended with error code: ", meta.ErrorCode).WriteToLog()
 			common.Interrupt(s.input)
 			common.Interrupt(s.output)
 		}
@@ -375,6 +459,12 @@ func (m *ClientWorker) handleStatusEnd(meta *FrameMetadata, reader *buf.Buffered
 }
 
 func (m *ClientWorker) fetchOutput() {
+	if !m.negotiated {
+		newError("fetchOutput started before negotiation").AtError().WriteToLog()
+		common.Must(m.done.Close())
+		return
+	}
+
 	defer func() {
 		common.Must(m.done.Close())
 	}()
@@ -400,6 +490,9 @@ func (m *ClientWorker) fetchOutput() {
 			err = m.handleStatusNew(&meta, reader)
 		case SessionStatusKeep:
 			err = m.handleStatusKeep(&meta, reader)
+		case SessionStatusNegotiateVersion:
+			// 协商后不应再收到此帧
+			err = newError("unexpected NegotiateVersion frame after initial negotiation")
 		default:
 			status := meta.SessionStatus
 			newError("unknown status: ", status).AtError().WriteToLog()
