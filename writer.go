@@ -128,6 +128,7 @@ func (w *Writer) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		if w.transferType == protocol.TransferTypeStream {
 			// 流模式按 8KB 分割，或者剩余所有数据
 			if mb.Len() > 8*1024 {
+				// 修正: buf.SplitSize 返回两个 buf.MultiBuffer
 				currentChunk, mb = buf.SplitSize(mb, 8*1024)
 			} else {
 				currentChunk = mb
@@ -135,7 +136,12 @@ func (w *Writer) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			}
 		} else {
 			// 包模式取第一个包
-			currentChunk, mb = buf.SplitFirst(mb)
+			// 修正: buf.SplitFirst 返回 buf.MultiBuffer 和 buf.Buffer
+			var firstBuffer *buf.Buffer
+			currentChunk, firstBuffer = buf.SplitFirst(mb)
+			if firstBuffer != nil { // Ensure firstBuffer is not nil before appending
+				currentChunk = append(currentChunk, firstBuffer)
+			}
 		}
 
 		chunkLen := uint32(currentChunk.Len())
@@ -152,6 +158,7 @@ func (w *Writer) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			consumed, ok := w.session.ConsumeCredit(chunkLen)
 			if ok {
 				// 成功消费了信用，发送相应部分的数据
+				// 修正: buf.SplitSize 返回两个 buf.MultiBuffer
 				partToSend, remainingInChunk := buf.SplitSize(currentChunk, int32(consumed))
 				if err := w.writeDataInternal(partToSend); err != nil {
 					return err
