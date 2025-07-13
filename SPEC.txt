@@ -1,0 +1,497 @@
+Network Working Group                                          [Your Name/Org]
+Internet-Draft                                                  July 13, 2025
+Intended status: Informational                                       Expires: January 14, 2026
+
+             Mux.Pro Protocol Specification
+             draft-[your-initials]-muxpro-00
+
+Abstract
+
+The Mux.Pro protocol is an advanced multiplexing transport protocol
+designed to carry multiple independent data streams over a single,
+established, reliable underlying data stream. It builds upon the
+concepts of the Mux.Cool protocol, introducing significant
+enhancements for sub-connection management, versioning, and clarity
+of operation. Mux.Pro aims to provide a more robust, flexible, and
+manageable solution for multiplexed data transport. This document
+specifies the format and behavior of the Mux.Pro protocol.
+
+Introduction
+
+The Mux.Pro protocol addresses the need for efficiently multiplexing
+various application data streams over a single network connection.
+Traditional methods often involve establishing a new underlying
+transport connection for each application stream, leading to
+increased overhead in terms of handshakes, resource allocation, and
+connection management. Mux.Pro mitigates these issues by allowing
+multiple logical "sub-connections" to share one "main connection."
+
+Mux.Pro is designed to be protocol-agnostic at its lower layer,
+meaning it can operate over any established reliable stream (e.g.,
+TCP, SCTP, QUIC streams). This flexibility ensures its adaptability
+to future networking technologies.
+
+It is important to note that the Mux.Pro protocol is not designed or
+intended to be an anti-censorship tool. Its primary focus is
+efficient multiplexing and improved stream management. Users seeking
+anti-censorship capabilities should layer Mux.Pro underneath or
+alongside dedicated anti-censorship protocols.
+
+Terminology
+
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+"SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and
+"OPTIONAL" in this document are to be interpreted as described in
+BCP 14 [RFC2119] [RFC8174] when they appear in all capitals, as
+shown here.
+
+Main Connection: The single, underlying reliable data stream over
+which Mux.Pro operates (e.g., a TCP connection).
+
+Sub-connection: A logical, independent data stream multiplexed over
+the Main Connection. Each sub-connection has a unique ID and its
+own state.
+
+Frame: The basic unit of data transfer in Mux.Pro. Each frame
+carries metadata and optionally additional data for a specific
+sub-connection or for main connection control.
+
+ID: A 2-byte unsigned integer that uniquely identifies a sub-
+connection within a Main Connection. For Main Connection control
+frames, the ID is 0x0000.
+
+Metadata: Structured control information carried within a Mux.Pro
+frame. Its format depends on the Frame Type (State).
+
+Extra Data: Optional payload data carried within a Mux.Pro frame,
+accompanying the metadata.
+
+Opt: A 1-byte field within Metadata containing various options bits.
+
+D (0x01): Data Present. When this bit is set, the frame carries
+Extra Data.
+
+Protocol Version
+
+The current version of the Mux.Pro protocol is 0x00000000
+(MuxPro/0.0).
+
+Mux.Pro protocol versions are represented by a 4-byte unsigned
+integer. The structure is [Major Version (2 bytes)] [Minor Version
+(2 bytes)].
+
+Major Version (bytes 0-1): Indicates significant, potentially
+backward-incompatible protocol changes. 0x0000 signifies a
+development/testing series.
+
+Minor Version (bytes 2-3): Indicates minor changes, new features, or
+compatible improvements within a Major Version. 0x0000 signifies
+the initial release of a Major Version.
+
+Dependencies
+
+Mux.Pro MUST operate on top of an already established, reliable,
+ordered, and bidirectional data stream. Examples of such underlying
+protocols include TCP, SCTP (stream 0), or individual streams within
+QUIC. Mux.Pro itself does not provide reliability, ordering, or
+congestion control; it relies on the underlying transport for these
+properties.
+
+Communication Process
+
+A single Mux.Pro Main Connection can carry multiple independent Sub-
+connections. Each Sub-connection has a unique ID and its own
+lifecycle. Data transfer occurs through the exchange of Frames.
+
+5.1. Client Behavior
+
+When a client requires a new connection and no suitable existing Main
+Connection is available, it initiates a new Main Connection to the
+server.
+
+Version Negotiation (REQUIRED): Immediately after establishing the
+underlying reliable data stream, the client MUST send a
+NegotiateVersion Frame (Section 6.3.1). This frame contains a
+list of Mux.Pro versions supported by the client, ordered from
+highest to lowest preference. The client MUST NOT send any other
+Mux.Pro frames until a valid NegotiateVersion response is
+received from the server.
+
+A single Main Connection can carry multiple Sub-connections. The
+client MAY decide the number of Sub-connections a Main Connection
+can handle.
+
+For a new Sub-connection, the client MUST send a New Frame (Section
+6.3.2) to inform the server to establish the Sub-connection.
+Subsequently, the client uses Keep Frames (Section 6.3.3) to
+transmit data for that Sub-connection.
+
+When a Sub-connection concludes, the client MUST send an End Frame
+(Section 6.3.4) to notify the server to close the Sub-connection.
+
+The client MAY decide when to close the Main Connection, but it
+SHOULD ensure the server is also aware of the connection state to
+avoid abrupt termination.
+
+The client MAY use KeepAlive Frames (Section 6.3.5) to prevent the
+server from closing the Main Connection due to inactivity.
+
+5.2. Server Behavior
+
+Upon receiving a new Main Connection request, the server SHOULD
+process it according to the Mux.Pro protocol.
+
+Version Negotiation (REQUIRED): Upon receiving a client's
+NegotiateVersion Frame (Section 6.3.1), the server MUST iterate
+through the client's provided version list to find the highest
+Mux.Pro version that both parties support.
+
+If a compatible version is found, the server MUST reply with a
+NegotiateVersion Frame containing only the selected common version.
+All subsequent communication over this Main Connection MUST adhere
+to the negotiated Mux.Pro version.
+
+If no compatible version is found, the server MUST immediately close
+the Main Connection. The server MAY send a Main Connection-level
+error indication to the client before closing, if such a mechanism
+is implemented (currently not defined beyond closing).
+
+When a New Frame is received, the server SHOULD process the new Sub-
+connection as a regular connection to the target address and port
+specified within the New Frame.
+
+When an End Frame (Section 6.3.4) is received, the server MAY close
+its upstream connection to the target address for that Sub-
+connection.
+
+In its responses for a Sub-connection, the server MUST use the same
+ID as the client's corresponding request to transmit data for that
+Sub-connection.
+
+The server MUST NOT send New Frames. New Frames are exclusively for
+client-initiated Sub-connection establishment.
+
+The server MAY use KeepAlive Frames (Section 6.3.5) to prevent the
+client from closing the Main Connection due to inactivity.
+
+Frame Format
+
+Mux.Pro employs a symmetric frame format; both clients and servers
+send and receive data using the same frame structure.
+
+Each Mux.Pro frame consists of a 2-byte Metadata Length (L) field,
+followed by the Metadata block of L bytes, and then optionally an
+Extra Data block.
+
++----------------+----------------+----------------+
+|  2 bytes       | L bytes        | X bytes        |
++----------------+----------------+----------------+
+| Metadata Length L | Metadata      | Extra Data      |
++----------------+----------------+----------------+
+
+6.1. Metadata Structure
+
+All Metadata types contain an ID and an Opt field. The Metadata
+Length L field indicates the total length of the Metadata block in
+bytes.
+
+  +----------------+----------------+------------------ ...
+  |  2 bytes       | 1 byte         | Variable Length    |
+  +----------------+----------------+------------------ ...
+  | ID             | State S        | Options/Fields... |
+  +----------------+----------------+------------------ ...
+
+ID: (2 bytes) A unique identifier for a Sub-connection. For Main
+Connection control frames, this MUST be 0x0000.
+
+State S: (1 byte) Defines the type of Metadata and the frame's
+purpose. Mux.Pro defines the following states:
+
+  0x00: NegotiateVersion (Main Connection Control)
+  0x01: New (New Sub-connection)
+  0x02: Keep (Keep Sub-connection / Data Transfer)
+  0x03: End (Close Sub-connection)
+  0x04: KeepAlive (Main Connection Keep-alive)
+  0x05: CreditUpdate (Sub-connection Flow Control)
+
+Opt: (1 byte) A bitmask for various options. The only currently
+defined option is D(0x01).
+
+D (0x01): Data Present. If this bit is set, an Extra Data block
+follows the Metadata block.
+
+6.2. Extra Data Format
+
+When the Opt(D) bit is set in the Metadata, an Extra Data block is
+present. The Extra Data block's format is as follows:
+
+  +----------------+----------------+
+  |  2 bytes       | L bytes        |
+  +----------------+----------------+
+  | Length L       | Data           |
+  +----------------+----------------+
+
+Length L: (2 bytes) The length of the Data field in bytes.
+
+Data: (L bytes) The actual payload data.
+
+6.3. Frame Types
+
+This section details the specific format and behavior of each Mux.Pro
+frame type.
+
+6.3.1. Negotiate Version Frame (State: 0x00)
+
+This frame is used for Main Connection-level version negotiation. It
+MUST be the first Mux.Pro frame sent by both the client and the
+server on a new Main Connection.
+
+  +----------------+----------------+----------------+----------------+----------------------+
+  |  2 bytes       | 1 byte         | 1 byte         | 1 byte         | Variable Length      |
+  +----------------+----------------+----------------+----------------+----------------------+
+  | ID (0x0000)    | State (0x00)   | Opt (0x01)     | Version Count N | Version N ... Version 1 |
+  +----------------+----------------+----------------+----------------+----------------------+
+
+ID: 0x0000 (REQUIRED for this frame type).
+
+State: 0x00 (REQUIRED for this frame type).
+
+Opt: The D(0x01) bit MUST be set, indicating the presence of the
+Version List as Extra Data. All other bits in Opt MUST be 0.
+
+Version Count N: (1 byte) The number of Mux.Pro versions listed.
+
+Version List (Extra Data):
+A sequence of N 4-byte Mux.Pro version numbers.
+Client Behavior: The client MUST list its supported versions in
+descending order (highest preference first).
+Server Behavior: The server MUST select the highest version from
+the client's list that it also supports. The server then
+replies with a NegotiateVersion frame where the Version Count
+N is 1 and the Version List contains only the single negotiated
+4-byte version. If no common version is found, the server MUST
+close the Main Connection.
+
+6.3.2. New Sub-connection Frame (State: 0x01)
+
+This frame is sent by the client to request the establishment of a
+new Sub-connection to a specific target.
+
+  +----------------+----------------+----------------+----------------+----------------+----------------+----------------+----------------+
+  |  2 bytes       | 1 byte         | 1 byte         | 1 byte         | 1 byte         | 2 bytes        | 1 byte         | Variable Length |
+  +----------------+----------------+----------------+----------------+----------------+----------------+----------------+----------------+
+  | ID             | State (0x01)   | Opt            | Network Type N | Priority P     | Port           | Address Type T | Address A       |
+  +----------------+----------------+----------------+----------------+----------------+----------------+----------------+----------------+
+
+ID: A unique 2-byte identifier chosen by the client for this new
+Sub-connection.
+
+State: 0x01 (REQUIRED for this frame type).
+
+Opt:
+D(0x01): If set, indicates that initial data for the Sub-
+connection is present in the Extra Data block following
+Address A.
+
+Network Type N: (1 byte) Specifies the desired network protocol for
+the target.
+0x01: TCP. The Sub-connection traffic SHOULD be sent to the
+target as TCP.
+0x02: UDP. The Sub-connection traffic SHOULD be sent to the
+target as UDP.
+
+Priority P: (1 byte) (MuxPro Extension) Specifies the scheduling
+priority for this Sub-connection. Lower numerical values indicate
+higher priority. Implementations SHOULD prioritize frames of Sub-
+connections with lower Priority P values when queueing or sending
+data.
+0x00: Highest Priority.
+0xFF: Lowest Priority.
+
+Port: (2 bytes) The target port number in network byte order.
+
+Address Type T: (1 byte) Specifies the type of the target address.
+0x01: IPv4 Address.
+0x02: Domain Name.
+0x03: IPv6 Address.
+
+Address A: (Variable Length) The target address.
+When T = 0x01: A is a 4-byte IPv4 address.
+When T = 0x02: A is a 1-byte length (L) followed by L bytes of
+domain name.
+When T = 0x03: A is a 16-byte IPv6 address.
+
+Extra Data: If Opt(D) is set, the Extra Data block immediately
+follows Address A and contains the initial data that needs to be
+sent to the target host.
+
+6.3.3. Keep Sub-connection Frame (State: 0x02)
+
+This frame is used to transmit data for an already established Sub-
+connection.
+
+  +----------------+----------------+----------------+
+  |  2 bytes       | 1 byte         | 1 byte         |
+  +----------------+----------------+----------------+
+  | ID             | State (0x02)   | Opt (D)        |
+  +----------------+----------------+----------------+
+
+ID: The 2-byte identifier of the Sub-connection this frame belongs
+to.
+
+State: 0x02 (REQUIRED for this frame type).
+
+Opt:
+D(0x01): If set, indicates that data for the Sub-connection is
+present in the Extra Data block.
+
+6.3.4. End Sub-connection Frame (State: 0x03)
+
+This frame is used to signal the graceful closure of a Sub-
+connection.
+
+  +----------------+----------------+----------------+----------------+
+  |  2 bytes       | 1 byte         | 1 byte         | 2 bytes        |
+  +----------------+----------------+----------------+----------------+
+  | ID             | State (0x03)   | Opt            | Error Code     |
+  +----------------+----------------+----------------+----------------+
+
+ID: The 2-byte identifier of the Sub-connection to be closed.
+
+State: 0x03 (REQUIRED for this frame type).
+
+Opt:
+D(0x01): If set, indicates that an Error Code is present in the
+metadata. If Opt(D) is not set, the Error Code is implicitly
+0x0000 (Graceful Shutdown).
+
+Error Code (MuxPro Extension): (2 bytes) An unsigned integer
+indicating the reason for the Sub-connection closure.
+0x0000: Graceful Shutdown. The Sub-connection is being closed
+normally.
+0x0001: Remote Disconnect. The remote target disconnected.
+0x0002: Operation Timeout. An operation on the Sub-connection
+timed out.
+0x0003: Protocol Error. A protocol violation occurred on this Sub-
+connection.
+0x0004: Resource Exhaustion. The server or client ran out of
+resources for this Sub-connection.
+0x0005: Destination Unreachable. The target address was
+unreachable.
+0x0006: Proxy Rejected. The proxy server rejected the Sub-
+connection request.
+Implementations MAY define additional error codes for specific
+scenarios.
+
+6.3.5. KeepAlive Frame (State: 0x04)
+
+This frame is used to signal liveness and prevent the Main
+Connection from being closed due to inactivity.
+
+  +----------------+----------------+----------------+
+  |  2 bytes       | 1 byte         | 1 byte         |
+  +----------------+----------------+----------------+
+  | ID             | State (0x04)   | Opt (0x00)     |
+  +----------------+----------------+----------------+
+
+ID: A random or arbitrary 2-byte value. It does not refer to any
+specific Sub-connection.
+
+State: 0x04 (REQUIRED for this frame type).
+
+Opt: MUST be 0x00. Mux.Pro KeepAlive frames MUST NOT carry any Extra
+Data. If a receiver encounters a KeepAlive frame with Opt not
+equal to 0x00, it MUST treat it as a protocol error.
+
+6.3.6. Credit Update Frame (State: 0x05)
+
+(MuxPro Extension) This frame is used by a receiver to grant
+additional credit for a specific Sub-connection, enabling the sender
+to transmit more data. This is part of the flow control mechanism.
+
+  +----------------+----------------+----------------+----------------+
+  |  2 bytes       | 1 byte         | 1 byte         | Variable Length |
+  +----------------+----------------+----------------+----------------+
+  | ID             | State (0x05)   | Opt (D)        | Credit Increment |
+  +----------------+----------------+----------------+----------------+
+
+ID: The 2-byte identifier of the Sub-connection for which credit is
+being granted.
+
+State: 0x05 (REQUIRED for this frame type).
+
+Opt: The D(0x01) bit MUST be set, indicating the presence of Credit
+Increment as Extra Data. All other bits in Opt MUST be 0.
+
+Credit Increment (Extra Data): A variable-length unsigned integer
+(e.g., 2 or 4 bytes, depending on implementation negotiation or
+fixed design) representing the number of additional bytes the
+sender is now allowed to transmit for this specific Sub-
+connection. Senders MUST track available credit per Sub-connection
+and only send data up to the granted limit. Receivers SHOULD send
+CreditUpdate frames when they have processed data and are ready to
+receive more, to prevent the sender's credit from depleting.
+
+Application Usage
+
+Mux.Pro is designed to be protocol-agnostic at its lower layer. It
+can theoretically utilize any reliable, ordered, bidirectional stream
+for carrying its protocol data.
+
+For compatibility with target-oriented protocols like Shadowsocks and
+VMess, where connection establishment typically includes a designated
+address, Mux.Pro suggests using "mux.pro" as a special target
+address. When the Main Connection's target address matches "mux.pro"
+(or a derived representation based on the underlying protocol's
+address encoding), the connection SHOULD be handled as a Mux.Pro
+forwarding stream. Otherwise, it SHOULD be handled according to
+traditional forwarding methods. This approach allows a single proxy
+endpoint to support both Mux.Pro and other protocols transparently.
+
+Security Considerations
+
+Mux.Pro, as a multiplexing protocol, does not inherently provide
+cryptographic security, authentication, or integrity protection for
+its frames or the multiplexed sub-connections. It relies entirely on
+the security properties of the underlying reliable data stream. If
+confidentiality, integrity, or authentication are required, the
+underlying transport (e.g., TLS over TCP, DTLS over UDP, or a secure
+QUIC connection) MUST provide these features.
+
+Implementers SHOULD be aware that:
+
+The ID field for sub-connections is a simple 2-byte identifier
+and is not designed for cryptographic strength or collision
+resistance across different Main Connections. Its uniqueness is
+only guaranteed within a single Main Connection.
+
+The Priority P field, while useful for Quality of Service (QoS),
+could potentially be misused for denial-of-service attacks if not
+properly managed and rate-limited by server implementations.
+
+The CreditUpdate mechanism, while designed for flow control,
+could be exploited to starve or overload specific sub-connections
+if an attacker can manipulate or spoof these frames. Proper
+authentication and integrity protection of the Main Connection
+are crucial.
+
+It is NOT RECOMMENDED to use Mux.Pro directly over an unsecured
+underlying transport for sensitive data.
+
+IANA Considerations
+
+This document has no IANA actions.
+
+References
+
+[RFC2119] Bradner, S., "Key words for use in RFCs to Indicate
+Requirement Levels", BCP 14, RFC 2119,
+DOI 10.17487/RFC2119, March 1997,
+https://www.rfc-editor.org/info/rfc2119.
+
+[RFC8174] Leiba, B., "Ambiguity of Uppercase vs Lowercase in
+RFC 2119 Key Words", BCP 14, RFC 8174,
+DOI 10.17487/RFC8174, May 2017,
+https://www.rfc-editor.org/info/rfc8174.
+
+(Optional: Append Authors' Contact Information)
