@@ -483,11 +483,6 @@ type Reader interface {
 	ReadMultiBuffer() (MultiBuffer, error)
 }
 
-// Writer is an interface for writing MultiBuffer.
-type Writer interface {
-	WriteMultiBuffer(MultiBuffer) error
-}
-
 // CopyOption is an option for Copy.
 type CopyOption func(*Buffer)
 
