@@ -344,8 +344,8 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 		common.Must(WriteUint32(creditPayload, DefaultInitialCredit)) // 增加 DefaultInitialCredit 信用
 		defer creditPayload.Release()
 
-		common.Must(serial.WriteUint16(creditFrame, uint16(creditPayload.Len())))
-		common.Must(creditFrame.Write(creditPayload.Bytes()))
+		Must2(serial.WriteUint16(creditFrame, uint16(creditPayload.Len())))
+		Must2(creditFrame.Write(creditPayload.Bytes()))
 
 		// 尝试发送 CreditUpdate 帧
 		if writeErr := w.link.Writer.WriteMultiBuffer(buf.MultiBuffer{creditFrame}); writeErr != nil {
