@@ -663,4 +663,3 @@ func (m *ClientWorker) fetchOutput() {
 		}
 	}
 }
-
