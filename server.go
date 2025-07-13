@@ -420,15 +420,15 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 			atomic.StoreInt64(&existingEntry.LastActivity, time.Now().UnixNano())
 			// Only update OriginalSource if it's different.
 			// Compare Address and Port fields manually.
-			// net.Address interface does not have an Equals method, so compare based on Family and then IP/Domain string.
 			addressesEqual := false
+			// Correctly use Family() method on the Address interface
 			if existingEntry.OriginalSource.Address.Family() == udpSrc.Address.Family() {
-				if existingEntry.OriginalSource.Address.IsIP() {
+				if existingEntry.OriginalSource.Address.Family().IsIP() { // Corrected: Call IsIP on AddressFamily
 					// For IP addresses, use net.IP.Equal
 					if existingEntry.OriginalSource.Address.IP().Equal(udpSrc.Address.IP()) {
 						addressesEqual = true
 					}
-				} else if existingEntry.OriginalSource.Address.IsDomain() {
+				} else if existingEntry.OriginalSource.Address.Family().IsDomain() { // Corrected: Call IsDomain on AddressFamily
 					// For domain addresses, compare strings
 					if existingEntry.OriginalSource.Address.Domain() == udpSrc.Address.Domain() {
 						addressesEqual = true
